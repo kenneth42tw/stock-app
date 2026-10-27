@@ -151,7 +151,10 @@ h3 { padding-top: .6rem; }
 
 /* ===== App 質感與手機版優化 ===== */
 html { scroll-behavior:smooth; -webkit-tap-highlight-color:transparent; }
-[data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu { visibility:hidden; height:0; }
+[data-testid="stDecoration"], #MainMenu, [data-testid="stToolbarActions"], [data-testid="stMainMenu"],
+[data-testid="stAppDeployButton"] { visibility:hidden; }
+[data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapsedControl"],
+[data-testid="stSidebarCollapseButton"] { visibility:visible !important; opacity:1 !important; }
 [data-testid="stHeader"] { background:transparent; }
 .stApp { padding-bottom: env(safe-area-inset-bottom, 0px); }
 .stTabs [data-baseweb="tab-list"] { overflow-x:auto; scrollbar-width:none; flex-wrap:nowrap; }
