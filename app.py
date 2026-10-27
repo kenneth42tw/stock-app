@@ -416,29 +416,48 @@ def finmind(dataset, code, days):
         return pd.DataFrame()
 
 
+def _news_from_rss(url, direct=False):
+    """解析 RSS → 新聞清單(台北時間、由新到舊)。direct=True 時從 Bing 中轉網址取出原始出處連結。"""
+    from email.utils import parsedate_to_datetime
+    from datetime import timezone
+    from urllib.parse import urlparse, parse_qs
+    tw = timezone(timedelta(hours=8))
+    r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    out, seen = [], set()
+    for i in ET.fromstring(r.content).iter("item"):
+        link = (i.findtext("link", "") or "").strip()
+        if direct:
+            real = parse_qs(urlparse(link).query).get("url", [""])[0]
+            if real.startswith("http"):
+                link = real
+        title = (i.findtext("title", "") or "").strip()
+        if not link or not title or link in seen:
+            continue
+        seen.add(link)
+        raw_d = i.findtext("pubDate", "") or ""
+        try:
+            dt = parsedate_to_datetime(raw_d).astimezone(tw)
+        except Exception:
+            dt = None
+        out.append({"title": title, "link": link, "ts": dt.timestamp() if dt else 0,
+                    "date": dt.strftime("%Y-%m-%d %H:%M") if dt else raw_d[:16]})
+    out.sort(key=lambda x: x["ts"], reverse=True)  # 最新在最上面
+    return out[:12]
+
+
 @st.cache_data(ttl=1800)
 def get_news(code, name):
-    url = ("https://news.google.com/rss/search?q=" + quote(f"{code} {name} 股".strip())
-           + "&hl=zh-TW&gl=TW&ceid=TW:zh-Hant")
-    try:
-        from email.utils import parsedate_to_datetime
-        from datetime import timezone
-        tw = timezone(timedelta(hours=8))
-        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-        out = []
-        for i in ET.fromstring(r.content).iter("item"):
-            raw_d = i.findtext("pubDate", "") or ""
-            try:
-                dt = parsedate_to_datetime(raw_d).astimezone(tw)
-            except Exception:
-                dt = None
-            out.append({"title": i.findtext("title", ""), "link": (i.findtext("link", "") or "").strip(),
-                        "ts": dt.timestamp() if dt else 0,
-                        "date": dt.strftime("%Y-%m-%d %H:%M") if dt else raw_d[:16]})
-        out.sort(key=lambda x: x["ts"], reverse=True)  # 最新在最上面
-        return out[:12]
-    except Exception:
-        return []
+    q = quote(f"{code} {name} 股".strip())
+    # 1) 先用 Bing News(可取得出處原始網址,App 內也能直接開);2) 失敗再退回 Google News
+    for url, direct in ((f"https://www.bing.com/news/search?q={q}&format=rss&setlang=zh-TW&cc=TW", True),
+                        (f"https://news.google.com/rss/search?q={q}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant", False)):
+        try:
+            res = _news_from_rss(url, direct)
+            if res:
+                return res
+        except Exception:
+            continue
+    return []
 
 
 def indicators(df):
