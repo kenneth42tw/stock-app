@@ -148,6 +148,30 @@ h3 { padding-top: .6rem; }
 [data-testid="stSidebar"] { border-right:1px solid rgba(128,128,128,.18); }
 [data-testid="stSidebar"] h3 { font-size:1rem; margin-top:.4rem; opacity:.85; }
 [data-testid="stSidebar"] [role="radiogroup"] { gap:6px; }
+
+/* ===== App 質感與手機版優化 ===== */
+html { scroll-behavior:smooth; -webkit-tap-highlight-color:transparent; }
+[data-testid="stToolbar"], [data-testid="stDecoration"], #MainMenu { visibility:hidden; height:0; }
+[data-testid="stHeader"] { background:transparent; }
+.stApp { padding-bottom: env(safe-area-inset-bottom, 0px); }
+.stTabs [data-baseweb="tab-list"] { overflow-x:auto; scrollbar-width:none; flex-wrap:nowrap; }
+.stTabs [data-baseweb="tab-list"]::-webkit-scrollbar { display:none; }
+.stTabs [data-baseweb="tab"] { white-space:nowrap; }
+.stButton > button, [data-baseweb="input"] input { min-height:44px; }
+@media (max-width: 640px) {
+  .block-container { padding:1rem .8rem 4rem; }
+  .hero { padding:14px 16px; border-radius:14px; margin-bottom:14px; }
+  .hero .t { font-size:1.2rem; }
+  .hero .s { font-size:.74rem; }
+  .qcard { padding:14px 16px; border-radius:14px; gap:14px; }
+  .qcard .nm { font-size:1.15rem; }
+  .qcard .px { font-size:2rem; }
+  .stats { grid-template-columns:repeat(2,1fr); width:100%; }
+  [data-testid="stMetric"] { padding:10px 12px; }
+  [data-testid="stMetricValue"] { font-size:1.25rem; }
+  .stTabs [data-baseweb="tab"] { padding:0 12px; height:40px; font-size:.9rem; }
+  h1 { font-size:1.5rem; } h2 { font-size:1.3rem; } h3 { font-size:1.1rem; }
+}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
