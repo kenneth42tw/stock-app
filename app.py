@@ -421,9 +421,22 @@ def get_news(code, name):
     url = ("https://news.google.com/rss/search?q=" + quote(f"{code} {name} 股".strip())
            + "&hl=zh-TW&gl=TW&ceid=TW:zh-Hant")
     try:
+        from email.utils import parsedate_to_datetime
+        from datetime import timezone
+        tw = timezone(timedelta(hours=8))
         r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-        return [{"title": i.findtext("title", ""), "date": i.findtext("pubDate", "")[:16],
-                 "link": i.findtext("link", "")} for i in ET.fromstring(r.content).iter("item")][:12]
+        out = []
+        for i in ET.fromstring(r.content).iter("item"):
+            raw_d = i.findtext("pubDate", "") or ""
+            try:
+                dt = parsedate_to_datetime(raw_d).astimezone(tw)
+            except Exception:
+                dt = None
+            out.append({"title": i.findtext("title", ""), "link": (i.findtext("link", "") or "").strip(),
+                        "ts": dt.timestamp() if dt else 0,
+                        "date": dt.strftime("%Y-%m-%d %H:%M") if dt else raw_d[:16]})
+        out.sort(key=lambda x: x["ts"], reverse=True)  # 最新在最上面
+        return out[:12]
     except Exception:
         return []
 
@@ -1019,6 +1032,9 @@ def combine_advice(alerts, lv, c, total):
         else: msg = "🔴 訊號偏空:持有者可考慮減碼並設好停損;未持有者先觀望。"
     else:
         msg = "⚪ 多空訊號互相抵銷,維持原本的操作建議(見「總覽與建議」)。"
+    # 短線提醒合計(net)與中線綜合評分(total)方向相反 → 明確提示
+    if (net >= 2 and total < 0) or (net <= -2 and total > 0):
+        msg += "\n\n⚠️ 短線訊號與中線評分方向不一致(短線反彈/中長線趨勢分歧)"
     return net, msg
 
 
@@ -2328,8 +2344,14 @@ with tab5:
     st.plotly_chart(fig, use_container_width=True)
 
 with tab6:
-    for n in news:
-        st.markdown(f"- [{n['title']}]({n['link']})  \n  <small>{n['date']}</small>", unsafe_allow_html=True)
+    for n in sorted(news, key=lambda x: x.get("ts", 0), reverse=True):
+        _t, _u = _html.escape(n["title"]), _html.escape(n["link"], quote=True)
+        # 網頁版:新分頁開啟;手機 App(WebView/PWA)常擋 target=_blank,因此另附「本頁開啟」連結
+        st.markdown(
+            f'<div style="margin:0 0 .8rem 0">'
+            f'<a href="{_u}" target="_blank" rel="noopener noreferrer">{_t}</a><br>'
+            f'<small>{n["date"]} ｜ <a href="{_u}" target="_self">📱 App 點這裡開啟</a></small></div>',
+            unsafe_allow_html=True)
     if not news:
         st.write("沒有抓到新聞")
 
