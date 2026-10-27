@@ -900,6 +900,8 @@ def test_push():
 def push_batch(items):
     if not items:
         return
+    if not st.session_state.get("notify_ok", True):
+        return
     allt = "\n\n".join(t for t, _ in items)[:3900]
     strong = [t for t, sg in items if sg]
     push_telegram(allt)
@@ -1929,10 +1931,17 @@ with st.sidebar:
     hold_cost = st.number_input("持有成本價(選填,0=未持有;用於停損停利提醒)", min_value=0.0, value=0.0, step=0.5)
     sl_pct = st.number_input("固定停損(%,可手動調整)", min_value=0.5, max_value=50.0, value=7.0, step=0.5)
     tp_pct = st.number_input("固定停利(%,可手動調整)", min_value=0.5, max_value=300.0, value=15.0, step=0.5)
+    _nk = st.text_input("通知密碼(只有你自己需要,朋友留空)", value=st.query_params.get("k", ""), type="password")
+    st.session_state["notify_ok"] = (not os.environ.get("NOTIFY_KEY")) or _nk == os.environ.get("NOTIFY_KEY")
+    if os.environ.get("NOTIFY_KEY") and not st.session_state["notify_ok"]:
+        st.caption("🔕 未輸入通知密碼:僅顯示畫面提醒,不會寄信/推播")
     if st.button("📲 發送測試推播"):
-        st.toast("這是測試提醒", icon="🔔")
-        for _line in test_push():
-            st.write(_line)
+        if not st.session_state["notify_ok"]:
+            st.warning("請先輸入通知密碼")
+        else:
+            st.toast("這是測試提醒", icon="🔔")
+            for _line in test_push():
+                st.write(_line)
     auto = st.checkbox("自動更新即時報價", value=False)
     secs = st.slider("更新間隔(秒)", 5, 60, 10)
     st.caption("KK版權所有,僅供資訊整理,不構成投資建議")
