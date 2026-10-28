@@ -2701,16 +2701,19 @@ with tabBasic:
         _mcap = _px * _shares if _shares else yi.get("marketCap")
         _iq = get_income_q(code)
         _ttm_eps = float(_iq["EPS"].dropna().tail(4).sum()) if not _iq.empty and _iq["EPS"].dropna().size >= 4 else None
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("市值", f"{_mcap / 1e8:,.0f} 億" if _mcap else "—")
-        m2.metric("本益比", f"{float(_cur.PER):.1f}" if _cur is not None and float(_cur.PER) > 0 else "—")
-        m3.metric("股價淨值比", f"{float(_cur.PBR):.2f}" if _cur is not None and float(_cur.PBR) > 0 else "—")
-        m4.metric("殖利率", f"{float(_cur.dividend_yield):.2f}%" if _cur is not None and float(_cur.dividend_yield) > 0 else "—")
-        m5, m6, m7, m8 = st.columns(4)
-        m5.metric("近四季 EPS", f"{_ttm_eps:.2f} 元" if _ttm_eps is not None else "—")
-        m6.metric("52週最高", f"{_h52.High.max():.2f}" if not _h52.empty else "—")
-        m7.metric("52週最低", f"{_h52.Low.min():.2f}" if not _h52.empty else "—")
-        m8.metric("Beta", f"{yi['beta']:.2f}" if yi.get("beta") else "—")
+        def _mcap_txt(v):
+            if not v:
+                return "—"
+            return f"{v / 1e12:,.2f} 兆" if v >= 1e12 else f"{v / 1e8:,.0f} 億"
+        st.markdown(_cards_html([
+            ("市值", _mcap_txt(_mcap), None),
+            ("本益比", f"{float(_cur.PER):.1f}" if _cur is not None and float(_cur.PER) > 0 else "—", None),
+            ("股價淨值比", f"{float(_cur.PBR):.2f}" if _cur is not None and float(_cur.PBR) > 0 else "—", None),
+            ("殖利率", f"{float(_cur.dividend_yield):.2f}%" if _cur is not None and float(_cur.dividend_yield) > 0 else "—", None),
+            ("近四季 EPS", f"{_ttm_eps:,.2f} 元" if _ttm_eps is not None else "—", None),
+            ("52週最高", f"{_h52.High.max():,.2f}" if not _h52.empty else "—", None),
+            ("52週最低", f"{_h52.Low.min():,.2f}" if not _h52.empty else "—", None),
+            ("Beta", f"{yi['beta']:.2f}" if yi.get("beta") else "—", None)]), unsafe_allow_html=True)
 
         st.markdown("#### 公司資料")
         g = lambda k, *alts: prof.get(k) or next((yp[a] for a in (k,) + alts if yp.get(a)), "")   # 證交所資料優先,缺的用 Yahoo 補
