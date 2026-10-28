@@ -2298,10 +2298,14 @@ def _lock_component():
     return components.declare_component("kk_lock_store", path=d)
 
 
+def _norm_locks(L):
+    return {k: v for k, v in dict(L).items() if v}
+
+
 def _commit_locks(L):
-    L = {k: v for k, v in dict(L).items() if v}
+    L = _norm_locks(L)
     if not (L.get("single") or L.get("multi_sel") or L.get("multi_txt")):
-        L = {}
+        L.pop("mode", None)
     ss = st.session_state
     ss["_locks"] = L
     ss["_ls_write"] = json.dumps(L, ensure_ascii=False) if L else ""
@@ -2311,47 +2315,51 @@ def _commit_locks(L):
 
 def _on_lock_single(key):
     L = dict(st.session_state.get("_locks", {}))
-    if st.session_state.get(key):
+    if st.session_state.get(key):                      # 開啟:記住目前這檔
+        L.pop("off_single", None)
         cur = st.session_state.get("_cur_code", "")
-        if not cur:
-            st.toast("請先選好股票再鎖定")
-            _commit_locks(L)
-            return
-        L["single"], L["mode"] = cur, "單一股票"
-    else:
+        if cur:
+            L["single"], L["mode"] = cur, "單一股票"
+    else:                                              # 關閉:不再記憶,並清掉已存的
+        L["off_single"] = True
         L.pop("single", None)
-        L["mode"] = "多股同時分析" if (L.get("multi_sel") or L.get("multi_txt")) else None
+        if L.get("mode") == "單一股票":
+            L["mode"] = "多股同時分析" if (L.get("multi_sel") or L.get("multi_txt")) else None
     _commit_locks(L)
 
 
 def _on_lock_multi(key):
     L = dict(st.session_state.get("_locks", {}))
     if st.session_state.get(key):
+        L.pop("off_multi", None)
         sel, txt = list(st.session_state.get("multi_sel", [])), st.session_state.get("multi_txt", "")
-        if not sel and not txt.strip():
-            st.toast("清單是空的,請先選擇股票再鎖定")
-            _commit_locks(L)
-            return
-        L["multi_sel"], L["multi_txt"], L["mode"] = sel, txt, "多股同時分析"
+        if sel or txt.strip():
+            L["multi_sel"], L["multi_txt"], L["mode"] = sel, txt, "多股同時分析"
     else:
+        L["off_multi"] = True
         L.pop("multi_sel", None)
         L.pop("multi_txt", None)
-        L["mode"] = "單一股票" if L.get("single") else None
+        if L.get("mode") == "多股同時分析":
+            L["mode"] = "單一股票" if L.get("single") else None
     _commit_locks(L)
 
 
-def _relock_single():
-    L = dict(st.session_state.get("_locks", {}))
-    if st.session_state.get("_cur_code"):
-        L["single"] = st.session_state["_cur_code"]
-    _commit_locks(L)
-
-
-def _relock_multi():
-    L = dict(st.session_state.get("_locks", {}))
-    L["multi_sel"] = list(st.session_state.get("multi_sel", []))
-    L["multi_txt"] = st.session_state.get("multi_txt", "")
-    _commit_locks(L)
+def _auto_lock(mode, code, sel, txt):
+    """預設一律鎖定:自動記住「最後一次」的模式與選股(單一股票 / 多股清單),使用者關掉開關才停止記憶。"""
+    ss = st.session_state
+    if not ss.get("_locks_loaded"):                    # 還沒讀到瀏覽器裡的舊資料前,不可覆蓋
+        return
+    old = _norm_locks(ss.get("_locks", {}))
+    L = dict(old)
+    if mode == "單一股票" and code and not L.get("off_single"):
+        L["single"], L["mode"] = code, "單一股票"
+    elif mode == "多股同時分析" and not L.get("off_multi"):
+        L["multi_sel"], L["multi_txt"] = list(sel), txt
+        if sel or txt.strip():
+            L["mode"] = "多股同時分析"
+    if _norm_locks(L) != old:
+        _commit_locks(L)
+        st.rerun()                                     # 讓元件在下一輪把新資料寫進瀏覽器
 
 
 def _apply_locks(L):
@@ -2414,13 +2422,9 @@ with st.sidebar:
         st.session_state["_cur_code"] = code
         _lk = st.session_state.get("_locks", {})
         _kS = f"lock_single_{st.session_state.get('_lock_ver', 0)}"
-        st.toggle("🔒 鎖定此股票(下次開啟自動帶出)", value=bool(_lk.get("single")), key=_kS,
-                  on_change=_on_lock_single, args=(_kS,))
-        if _lk.get("single") and code and _lk["single"] != code:
-            st.caption(f"目前鎖定:{_lk['single']}(正在看的是 {code})")
-            st.button("改鎖定為目前這檔", on_click=_relock_single)
-        elif _lk.get("single"):
-            st.caption("已鎖定,下次開啟會自動帶出這檔。")
+        st.toggle("🔒 鎖定並記住上次選股", value=not _lk.get("off_single"), key=_kS,
+                  on_change=_on_lock_single, args=(_kS,),
+                  help="預設開啟:自動記住你最後看的股票,下次開啟直接帶出。關閉後,下次開啟回到預設的 2330。")
     elif mode == "多股同時分析":
         _opts = [f"{r.stock_id} {r.stock_name}" for r in stock_list.itertuples()]
         if "multi_sel" not in st.session_state:
@@ -2439,14 +2443,9 @@ with st.sidebar:
         st.caption(f"目前共 {len(multi_list)} 檔(最多 20 檔)")
         _lk = st.session_state.get("_locks", {})
         _kM = f"lock_multi_{st.session_state.get('_lock_ver', 0)}"
-        _locked_m = bool(_lk.get("multi_sel") or _lk.get("multi_txt"))
-        st.toggle("🔒 鎖定目前清單(下次開啟自動帶出)", value=_locked_m, key=_kM,
-                  on_change=_on_lock_multi, args=(_kM,))
-        if _locked_m and (list(_lk.get("multi_sel", [])) != list(_sel) or _lk.get("multi_txt", "") != _txt):
-            st.caption("目前清單與鎖定的清單不同。")
-            st.button("更新鎖定清單", on_click=_relock_multi)
-        elif _locked_m:
-            st.caption("已鎖定,下次開啟會自動帶出這份清單。")
+        st.toggle("🔒 鎖定並記住上次清單", value=not _lk.get("off_multi"), key=_kM,
+                  on_change=_on_lock_multi, args=(_kM,),
+                  help="預設開啟:自動記住你最後選的股票清單,下次開啟直接帶出。關閉後,下次開啟回到預設清單。")
     st.subheader("觸發提醒設定")
     buy_th = st.slider("技術分數 ≥ 時買進", 0, 8, 3,  help="技術分數由法人+融資券+股票估值計算,分數正值為多頭")
     
@@ -2481,6 +2480,11 @@ with st.sidebar:
     auto = st.checkbox("自動更新即時報價", value=False)
     secs = st.slider("更新間隔(秒)", 5, 60, 10)
     st.caption("KK版權所有,僅供資訊整理,不構成投資建議")
+
+if mode == "單一股票":
+    _auto_lock(mode, code, [], "")
+elif mode == "多股同時分析":
+    _auto_lock(mode, "", _sel, _txt)
 
 if mode == "全市場勝率掃描":
     render_scan()
