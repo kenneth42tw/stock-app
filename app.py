@@ -7,8 +7,10 @@
 本工具僅供資訊整理,不構成投資建議。
 """
 import importlib.util
+import json
 import os
 import re
+import tempfile
 import smtplib
 import time
 from email.message import EmailMessage
@@ -613,8 +615,8 @@ def tech_chart(df, n=200, levels=None):
     fig.add_trace(go.Scatter(x=d.index, y=d.K, name="K"), 4, 1)
     fig.add_trace(go.Scatter(x=d.index, y=d.D, name="D"), 4, 1)
     fig.add_trace(go.Scatter(x=d.index, y=d.RSI, name="RSI", line=dict(dash="dot")), 4, 1)
-    for key, label, color in (("big", "大舉買入", "darkgreen"), ("small", "小額加碼", "green"),
-                              ("trim", "分批減碼", "orange"), ("stop", "停損", "red")):
+    for key, label, color in (("big", "大舉買入", "darkred"), ("small", "小額加碼", "red"),
+                              ("trim", "分批減碼", "green"), ("stop", "停損", "darkgreen")):
         if levels:
             fig.add_hline(y=levels[key], row=1, col=1, line_dash="dash", line_color=color,
                           annotation_text=f"{label} {levels[key]:.2f}", annotation_position="right")
@@ -1046,15 +1048,15 @@ def combine_advice(alerts, lv, c, total):
     low, high, broke = c <= lv["small"], c >= lv["trim"], c <= lv["stop"]
     if net >= 2:
         if high: msg = "🟠 多項訊號偏多,但股價已在高檔區:不建議追高,持有者可續抱,新進場等拉回。"
-        elif low: msg = "🟢 多項訊號偏多,且股價在低檔區:可考慮分批買進(先小量,再依走勢加碼)。"
-        else: msg = "🟢 多項訊號偏多,股價在中間區:可小量布局,拉回月線附近再加碼。"
+        elif low: msg = "🔴 多項訊號偏多,且股價在低檔區:可考慮分批買進(先小量,再依走勢加碼)。"
+        else: msg = "🔴 多項訊號偏多,股價在中間區:可小量布局,拉回月線附近再加碼。"
         if total <= -4: msg += " 但整體評分偏空,請降低部位。"
     elif net <= -2:
-        if any(a.get("id") == "S7L" for a in alerts): msg = "🔻 長線翻空(季線失守):應果斷停損/停利離場,禁止低接或攤平。"
-        elif broke: msg = "🔻 訊號偏空且已跌破停損參考價:建議減碼或停損出場。"
+        if any(a.get("id") == "S7L" for a in alerts): msg = "🟢 長線翻空(季線失守):應果斷停損/停利離場,禁止低接或攤平。"
+        elif broke: msg = "🟢 訊號偏空且已跌破停損參考價:建議減碼或停損出場。"
         elif low: msg = "🟡 訊號偏空,但股價已跌到低檔區:不要一次接刀,等止跌訊號,最多小量試單。"
-        elif high: msg = "🔴 訊號偏空且股價在高檔區:持有者建議分批減碼或獲利了結。"
-        else: msg = "🔴 訊號偏空:持有者可考慮減碼並設好停損;未持有者先觀望。"
+        elif high: msg = "🟢 訊號偏空且股價在高檔區:持有者建議分批減碼或獲利了結。"
+        else: msg = "🟢 訊號偏空:持有者可考慮減碼並設好停損;未持有者先觀望。"
     else:
         msg = "⚪ 多空訊號互相抵銷,維持原本的操作建議(見「總覽與建議」)。"
     # 短線提醒合計(net)與中線綜合評分(total)方向相反 → 明確提示
@@ -1556,7 +1558,7 @@ def render_multi(stocks, th):
     st.caption("綜合評分 = 技術 + 法人 + 融資券 + 估值;提醒合計 = 所有提醒方向強度加總(正偏多、負偏空)。多股模式不含 5 分鐘爆量與持有成本停損提醒。")
     items = []
     for r in res:
-        icon = "🟢" if r["net"] >= 2 else "🔴" if r["net"] <= -2 else "⚪"
+        icon = "🔴" if r["net"] >= 2 else "🟢" if r["net"] <= -2 else "⚪"
         with st.expander(f"{icon} {r['name']}({r['code']}) {r['price']:.2f} {r['chg']:+.2f}% 綜合 {r['total']:+d} 提醒 {r['net']:+d}"):
             line, d = sig_line(r["alerts"])
             if line:
@@ -1899,9 +1901,9 @@ def price_levels(df, total):
         stop, stop_b = big * 0.97, f"跌破大舉買入區 {big:.2f} 再留 3% 緩衝"
 
     if c <= stop: zone = "⛔ 已跌破停損參考價,趨勢轉弱,建議檢討是否出場"
-    elif c <= big: zone = "🟢 大舉買入區(請先確認不是基本面轉壞造成的下跌,並仍建議分批)"
+    elif c <= big: zone = "🔴 大舉買入區(請先確認不是基本面轉壞造成的下跌,並仍建議分批)"
     elif c <= small: zone = "🟡 小額加碼區"
-    elif c >= take: zone = "🔴 高檔區,可考慮大幅獲利了結"
+    elif c >= take: zone = "🟢 高檔區,可考慮大幅獲利了結"
     elif c >= trim: zone = "🟠 分批減碼區"
     else: zone = "⚪ 中間區域,持有或觀望為主"
     return dict(big=big, small=small, trim=trim, take=take, stop=stop, zone=zone, total=total, close=c,
@@ -1925,16 +1927,16 @@ def level_text(lv, c):
 
 def action_now(lv, total, c):
     if c <= lv["stop"]:
-        return "🔻 **建議:停損或大幅減碼**——股價已跌破關鍵支撐,先保本,等止穩後再評估。"
+        return "🟢 **建議:停損或大幅減碼**——股價已跌破關鍵支撐,先保本,等止穩後再評估。"
     if c <= lv["big"]:
-        return ("🟢 **建議:大舉買入(分2~3次進場)**——已回檔到深度支撐區,綜合評分不差。" if total >= 0
-                else "🟢 **建議:分批買入,首批先小量**——價位已低,但綜合評分偏空,要防續跌。")
+        return ("🔴 **建議:大舉買入(分2~3次進場)**——已回檔到深度支撐區,綜合評分不差。" if total >= 0
+                else "🔴 **建議:分批買入,首批先小量**——價位已低,但綜合評分偏空,要防續跌。")
     if c <= lv["small"]:
         if total >= 2: return "🟡 **建議:小額加碼**——回到支撐區,技術與籌碼偏多。"
         if total > -2: return "🟡 **建議:小量試單**——價位合理但訊號中性,站穩後再加碼。"
         return "⚪ **建議:暫不加碼**——雖在加碼區,但評分偏空,等止跌訊號。"
     if c >= lv["take"]:
-        return "🔴 **建議:大幅獲利了結**——已漲到近期高檔之上,僅留少量部位。"
+        return "🟢 **建議:大幅獲利了結**——已漲到近期高檔之上,僅留少量部位。"
     if c >= lv["trim"]:
         return "🟠 **建議:分批減碼**——接近壓力區,先收回部分獲利。"
     if total >= 4: return "⚪ **建議:持有,不追高**——趨勢偏多,拉回月線附近再考慮加碼。"
@@ -2264,13 +2266,131 @@ def _link_html(u):
     return f'<a href="{_html.escape(h, quote=True)}" target="_blank" rel="noopener noreferrer">{_html.escape(u)}</a>'
 
 
+# ===================== 鎖定功能:把鎖定的股票存在使用者自己的瀏覽器(localStorage),下次開啟自動帶出 =====================
+_LOCK_HTML = r'''<!DOCTYPE html><html><head><meta charset="utf-8"></head><body><script>
+const KEY = "kk_stock_locks_v1";
+function send(type, data) { window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: type}, data || {}), "*"); }
+let lastToken = null, lastSent = null;
+function readStore() { try { const v = window.localStorage.getItem(KEY); return v ? JSON.parse(v) : {}; } catch (e) { return {}; } }
+window.addEventListener("message", function (ev) {
+  const d = ev.data || {};
+  if (d.type !== "streamlit:render") return;
+  const a = d.args || {};
+  if (a.write !== null && a.write !== undefined && a.token !== lastToken) {
+    try { if (a.write === "") window.localStorage.removeItem(KEY); else window.localStorage.setItem(KEY, a.write); } catch (e) {}
+    lastToken = a.token;
+  }
+  const cur = JSON.stringify(readStore());
+  if (cur !== lastSent) { lastSent = cur; send("streamlit:setComponentValue", {value: JSON.parse(cur), dataType: "json"}); }
+});
+send("streamlit:componentReady", {apiVersion: 1});
+send("streamlit:setFrameHeight", {height: 0});
+</script></body></html>'''
+
+
+@st.cache_resource
+def _lock_component():
+    import streamlit.components.v1 as components
+    d = os.path.join(tempfile.gettempdir(), "kk_lock_store_component")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "index.html"), "w", encoding="utf-8") as f:
+        f.write(_LOCK_HTML)
+    return components.declare_component("kk_lock_store", path=d)
+
+
+def _commit_locks(L):
+    L = {k: v for k, v in dict(L).items() if v}
+    if not (L.get("single") or L.get("multi_sel") or L.get("multi_txt")):
+        L = {}
+    ss = st.session_state
+    ss["_locks"] = L
+    ss["_ls_write"] = json.dumps(L, ensure_ascii=False) if L else ""
+    ss["_ls_token"] = ss.get("_ls_token", 0) + 1
+    ss["_lock_ver"] = ss.get("_lock_ver", 0) + 1      # 換新的 widget key,讓鎖定開關依最新狀態重建
+
+
+def _on_lock_single(key):
+    L = dict(st.session_state.get("_locks", {}))
+    if st.session_state.get(key):
+        cur = st.session_state.get("_cur_code", "")
+        if not cur:
+            st.toast("請先選好股票再鎖定")
+            _commit_locks(L)
+            return
+        L["single"], L["mode"] = cur, "單一股票"
+    else:
+        L.pop("single", None)
+        L["mode"] = "多股同時分析" if (L.get("multi_sel") or L.get("multi_txt")) else None
+    _commit_locks(L)
+
+
+def _on_lock_multi(key):
+    L = dict(st.session_state.get("_locks", {}))
+    if st.session_state.get(key):
+        sel, txt = list(st.session_state.get("multi_sel", [])), st.session_state.get("multi_txt", "")
+        if not sel and not txt.strip():
+            st.toast("清單是空的,請先選擇股票再鎖定")
+            _commit_locks(L)
+            return
+        L["multi_sel"], L["multi_txt"], L["mode"] = sel, txt, "多股同時分析"
+    else:
+        L.pop("multi_sel", None)
+        L.pop("multi_txt", None)
+        L["mode"] = "單一股票" if L.get("single") else None
+    _commit_locks(L)
+
+
+def _relock_single():
+    L = dict(st.session_state.get("_locks", {}))
+    if st.session_state.get("_cur_code"):
+        L["single"] = st.session_state["_cur_code"]
+    _commit_locks(L)
+
+
+def _relock_multi():
+    L = dict(st.session_state.get("_locks", {}))
+    L["multi_sel"] = list(st.session_state.get("multi_sel", []))
+    L["multi_txt"] = st.session_state.get("multi_txt", "")
+    _commit_locks(L)
+
+
+def _apply_locks(L):
+    """第一次從瀏覽器讀到鎖定資料時,把鎖定的模式/股票套用到畫面(必須在側邊欄元件建立之前執行)。"""
+    ss = st.session_state
+    ss["_locks"] = L if isinstance(L, dict) else {}
+    L = ss["_locks"]
+    if L.get("mode") in ("單一股票", "多股同時分析"):
+        ss["mode"] = L["mode"]
+    if L.get("single"):
+        ss["query"] = L["single"]
+    if L.get("multi_sel") or L.get("multi_txt"):
+        try:
+            opts = {f"{r.stock_id} {r.stock_name}" for r in get_stock_list().itertuples()}
+        except Exception:
+            opts = set()
+        sel = [o for o in L.get("multi_sel", []) if o in opts] if opts else []
+        ss["_saved_multi_sel"], ss["_saved_multi_txt"] = sel, L.get("multi_txt", "")
+        ss.pop("multi_sel", None)           # 讓多股區塊重新用 _saved_* 初始化
+        ss.pop("multi_txt", None)
+    ss["_lock_ver"] = ss.get("_lock_ver", 0) + 1
+
+
 hero()
+try:   # 讀取瀏覽器裡的鎖定資料(失敗也不影響程式)
+    _stored = _lock_component()(write=st.session_state.get("_ls_write"), token=st.session_state.get("_ls_token", 0),
+                                 key="kk_lock_store", default=None)
+    if _stored is not None and not st.session_state.get("_locks_loaded"):
+        st.session_state["_locks_loaded"] = True
+        _apply_locks(_stored)
+except Exception:
+    pass
+st.session_state.setdefault("_locks", {})
 with st.sidebar:
     mode = st.radio("模式", ["單一股票", "多股同時分析", "全市場勝率掃描"], horizontal=True, key="mode")
     stock_list = get_stock_list()
     code, name, industry, multi_list = "", "", "", []
     if mode == "單一股票":
-        st.session_state.setdefault("query", "2330")
+        st.session_state.setdefault("query", st.session_state.get("_locks", {}).get("single", "2330"))
         query = st.text_input("股票代碼或中文名稱", key="query",
                               help="可輸入代碼(2330、0050)或名稱(台積電、元大台灣50),名稱支援部分關鍵字").strip()
         if re.fullmatch(r"[0-9]{4,6}[A-Za-z]?", query):
@@ -2291,6 +2411,16 @@ with st.sidebar:
             row = stock_list[stock_list.stock_id == code]
             if len(row):
                 name, industry = row.stock_name.iloc[0], row.industry_category.iloc[0]
+        st.session_state["_cur_code"] = code
+        _lk = st.session_state.get("_locks", {})
+        _kS = f"lock_single_{st.session_state.get('_lock_ver', 0)}"
+        st.toggle("🔒 鎖定此股票(下次開啟自動帶出)", value=bool(_lk.get("single")), key=_kS,
+                  on_change=_on_lock_single, args=(_kS,))
+        if _lk.get("single") and code and _lk["single"] != code:
+            st.caption(f"目前鎖定:{_lk['single']}(正在看的是 {code})")
+            st.button("改鎖定為目前這檔", on_click=_relock_single)
+        elif _lk.get("single"):
+            st.caption("已鎖定,下次開啟會自動帶出這檔。")
     elif mode == "多股同時分析":
         _opts = [f"{r.stock_id} {r.stock_name}" for r in stock_list.itertuples()]
         if "multi_sel" not in st.session_state:
@@ -2307,6 +2437,16 @@ with st.sidebar:
         st.session_state["_saved_multi_txt"] = _txt
         multi_list = parse_stock_inputs(_sel, _txt, stock_list)
         st.caption(f"目前共 {len(multi_list)} 檔(最多 20 檔)")
+        _lk = st.session_state.get("_locks", {})
+        _kM = f"lock_multi_{st.session_state.get('_lock_ver', 0)}"
+        _locked_m = bool(_lk.get("multi_sel") or _lk.get("multi_txt"))
+        st.toggle("🔒 鎖定目前清單(下次開啟自動帶出)", value=_locked_m, key=_kM,
+                  on_change=_on_lock_multi, args=(_kM,))
+        if _locked_m and (list(_lk.get("multi_sel", [])) != list(_sel) or _lk.get("multi_txt", "") != _txt):
+            st.caption("目前清單與鎖定的清單不同。")
+            st.button("更新鎖定清單", on_click=_relock_multi)
+        elif _locked_m:
+            st.caption("已鎖定,下次開啟會自動帶出這份清單。")
     st.subheader("觸發提醒設定")
     buy_th = st.slider("技術分數 ≥ 時買進", 0, 8, 3,  help="技術分數由法人+融資券+股票估值計算,分數正值為多頭")
     
