@@ -186,7 +186,7 @@ def hero():
              else '<span class="badge off"><i></i>休市 / 已收盤</span>')
     now = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
     st.markdown(f'<div class="hero"><div><div class="t">📈 台股分析儀表板</div>'
-                f'<div class="s">技術面 · 三大法人 · 融資融券 · 估值 · 新聞 · 回測 · 投資建議 ｜ 台北時間 {now}</div></div>'
+                f'<div class="s">技術面 · 三大法人 · 融資融券 · 估值 · 基本 · 財務 · 新聞 · 回測 · 投資建議 ｜ 台北時間 {now}</div></div>'
                 f'{badge}</div>', unsafe_allow_html=True)
 
 
@@ -284,29 +284,35 @@ def market_open():
     return t.weekday() < 5 and (9, 0) <= (t.hour, t.minute) <= (13, 30)
 
 
-@st.cache_data(ttl=5)
+def _mis_get(ex_ch, tries=3):
+    """呼叫證交所 MIS 即時 API(上市 tse / 上櫃 otc)。每次重新取得 cookie 並加時間戳避免快取,失敗最多重試 3 次。"""
+    for k in range(tries):
+        try:
+            sess = requests.Session()
+            sess.headers.update({"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36",
+                                 "Referer": "https://mis.twse.com.tw/stock/index.jsp",
+                                 "Accept": "application/json, text/javascript, */*; q=0.01",
+                                 "X-Requested-With": "XMLHttpRequest"})
+            sess.get("https://mis.twse.com.tw/stock/index.jsp", timeout=8)
+            r = sess.get("https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+                         params={"ex_ch": ex_ch, "json": 1, "delay": 0, "_": int(time.time() * 1000)}, timeout=8)
+            arr = r.json().get("msgArray", [])
+            if arr:
+                return arr
+        except Exception:
+            pass
+        time.sleep(0.4 * (k + 1))
+    return []
+
+
+@st.cache_data(ttl=5, show_spinner=False)
 def get_live_quote(code):
     try:
-        sess = requests.Session()
-        sess.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://mis.twse.com.tw/stock/index.jsp"})
-        sess.get("https://mis.twse.com.tw/stock/index.jsp", timeout=8)
-        for ex in ("tse", "otc"):
-            r = sess.get("https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
-                         params={"ex_ch": f"{ex}_{code}.tw", "json": 1, "delay": 0}, timeout=8).json()
-            arr = r.get("msgArray", [])
-            if not arr or not arr[0].get("n"):
-                continue
-            q = arr[0]
-            price = _f(q.get("z"))
-            if price is None:
-                b, a = _f(str(q.get("b", "")).split("_")[0]), _f(str(q.get("a", "")).split("_")[0])
-                price = (b + a) / 2 if b and a else _f(q.get("y"))
-            if price is None:
-                continue
-            return dict(price=price, open=_f(q.get("o")) or price, high=_f(q.get("h")) or price,
-                        low=_f(q.get("l")) or price, volume=int((_f(q.get("v")) or 0) * 1000),
-                        name=q.get("n", ""), date=q.get("d"), time=f"{q.get('d')} {q.get('t')}", source="證交所即時",
-                        prev=_f(q.get("y")), book={k: q.get(k, "") for k in "bagf"})
+        for q in _mis_get(f"tse_{code}.tw|otc_{code}.tw"):        # 一次查上市+上櫃,取有資料的那筆
+            if q.get("n") and q.get("c") == code:
+                lv = _parse_mis(q)
+                if lv:
+                    return lv
     except Exception:
         pass
     for suf in (".TW", ".TWO"):
@@ -1639,6 +1645,64 @@ def _download_batch(tickers, period):
     return out
 
 
+# 技術線型優先序:數字越小越前面(W底往上優先)
+LINE_RANK = {"W底突破": 0, "W底頸線待突破": 1, "W底右腳上揚": 2, "W底打底中": 3,
+             "多頭排列": 4, "盤整": 5, "空頭排列": 6}
+
+
+def detect_line_shape(hd, lookback=100):
+    """判斷技術線型。優先找 W 底(雙底):兩個相近低點 + 中間反彈高點(頸線),再依目前價位分成
+    突破 / 頸線待突破 / 右腳上揚 / 打底中;找不到 W 底則回傳 多頭排列 / 空頭排列 / 盤整。"""
+    try:
+        d = hd.tail(lookback)
+        c, lo, hi = d.Close.values.astype(float), d.Low.values.astype(float), d.High.values.astype(float)
+        n = len(c)
+        if n < 40:
+            return "盤整"
+        cl = c[-1]
+        lows = [i for i in range(3, n - 1) if lo[i] <= lo[max(0, i - 3):i + 4].min()]
+        for j in reversed(lows):
+            if j < n - 30:                       # 右腳要在最近 30 根 K 內
+                break
+            for i in reversed([x for x in lows if x < j]):
+                gap = j - i
+                if gap < 8:
+                    continue
+                if gap > 60:
+                    break
+                if not (lo[i] * 0.97 <= lo[j] <= lo[i] * 1.08):          # 右腳不明顯破前低,也不過高
+                    continue
+                if lo[i:j + 1].min() < min(lo[i], lo[j]) * 0.999:        # 兩腳之間不可有更低點
+                    continue
+                neck = hi[i:j + 1].max()
+                if neck < max(lo[i], lo[j]) * 1.06:                      # 中間反彈至少 6%,才像個 W
+                    continue
+                if cl < min(lo[i], lo[j]) * 0.99:                        # 已跌破雙底,型態失敗
+                    continue
+                if cl > neck:
+                    k = next((x for x in range(j + 1, n) if c[x] > neck), n - 1)
+                    if n - 1 - k <= 15 and cl <= neck * 1.15:
+                        return "W底突破"
+                    continue                                              # 突破已久/漲太多,不算「往上」訊號
+                ma5 = c[-5:].mean()
+                ma5_prev = c[-8:-3].mean()
+                if cl >= neck * 0.97:
+                    return "W底頸線待突破"
+                if cl > lo[j] * 1.03 and ma5 > ma5_prev:
+                    return "W底右腳上揚"
+                return "W底打底中"
+        ma20 = pd.Series(c).rolling(20).mean()
+        ma60 = pd.Series(c).rolling(60).mean()
+        if pd.notna(ma60.iloc[-1]):
+            if cl > ma20.iloc[-1] > ma60.iloc[-1] and ma20.iloc[-1] > ma20.iloc[-6]:
+                return "多頭排列"
+            if cl < ma20.iloc[-1] < ma60.iloc[-1]:
+                return "空頭排列"
+        return "盤整"
+    except Exception:
+        return "盤整"
+
+
 def scan_market(uni, guess, horizon, period, min_amt, progress, batch=40, use_live=True):
     """逐批下載 → 對每檔跑 situation_stats(沿用單股「歷史相似情境」同一套邏輯)→ 回傳結果表"""
     rows, rec = [], uni.to_dict("records")
@@ -1670,7 +1734,8 @@ def scan_market(uni, guess, horizon, period, min_amt, progress, batch=40, use_li
             t = SS["table"].iloc[0]
             rows.append({"代碼": r["stock_id"], "名稱": r["stock_name"], "產業": r["industry_category"],
                          "現價": float(hd.Close.iloc[-1]), "近20日均成交值(百萬)": amt / 1e6,
-                         "技術分數": SS["score"], "季線": "之上" if SS["above"] else "之下", "RSI區間": SS["zone"],
+                         "技術分數": SS["score"], "技術線型": detect_line_shape(hd),
+                         "季線": "之上" if SS["above"] else "之下", "RSI區間": SS["zone"],
                          "樣本數": int(t["樣本數"]), "獨立樣本": float(t["獨立樣本約"]),
                          "勝率%": float(t["勝率"]), "勝率下限%": float(t["勝率下限"]),
                          "全期基準勝率%": float(t["全期基準勝率"]),
@@ -1697,7 +1762,7 @@ def render_scan():
         st.error("股票清單載入失敗,請稍後再試。")
         return
     os.makedirs(SCAN_DIR, exist_ok=True)
-    fn = os.path.join(SCAN_DIR, f"scan_v3_{datetime.now():%Y%m%d}_L{int(use_live)}_{'live' if market_open() else 'close'}_{horizon}_{period}_{int(min_amt)}_{int(inc_etf)}.pkl")
+    fn = os.path.join(SCAN_DIR, f"scan_v4_{datetime.now():%Y%m%d}_L{int(use_live)}_{'live' if market_open() else 'close'}_{horizon}_{period}_{int(min_amt)}_{int(inc_etf)}.pkl")
     st.caption(f"掃描範圍約 {len(uni)} 檔。第一次掃描需下載全部歷史股價,約數分鐘到十幾分鐘;同參數當天掃過會直接讀快取。")
     cA, cB = st.columns([1, 1])
     run = cA.button("▶ 開始掃描(使用今日快取)", type="primary")
@@ -1720,6 +1785,9 @@ def render_scan():
     if res.empty:
         st.warning("沒有任何股票通過條件(可能是網路/Yahoo 限流),請稍後再試或放寬條件。")
         return
+    if "技術線型" not in res.columns:
+        res = res.assign(技術線型="—")
+        st.caption("此份結果來自舊版掃描,沒有『技術線型』資料,請按「強制重新掃描」。")
     meta = st.session_state.get("scan_meta", {})
     st.markdown(f"**結果:持有 {meta.get('h')} 個交易日**(掃描時間 {meta.get('t')},共 {len(res)} 檔有足夠歷史資料)")
     f1, f2, f3, f4 = st.columns(4)
@@ -1734,8 +1802,14 @@ def render_scan():
         v = v[v["產業"].isin(pick_ind)]
     if only_pos:
         v = v[(v["平均報酬%"] > 0) & (v["中位數%"] > 0)]
-    sort_by = st.selectbox("排序依據", ["勝率下限%(最保守,建議)", "勝率%", "勝率優勢%", "平均報酬%"], index=0)
-    v = v.sort_values(sort_by.split("(")[0], ascending=False).reset_index(drop=True)
+    sort_by = st.selectbox("排序依據", ["勝率下限%(最保守,建議)", "勝率%", "勝率優勢%", "平均報酬%",
+                                    "技術線型(W底往上優先)"], index=0,
+                           help="技術線型:W底突破 → W底頸線待突破 → W底右腳上揚 → W底打底中 → 多頭排列 → 盤整 → 空頭排列;同線型內再依勝率下限由高到低。")
+    if sort_by.startswith("技術線型"):
+        v = (v.assign(_r=v["技術線型"].map(LINE_RANK).fillna(9))
+              .sort_values(["_r", "勝率下限%"], ascending=[True, False]).drop(columns="_r").reset_index(drop=True))
+    else:
+        v = v.sort_values(sort_by.split("(")[0], ascending=False).reset_index(drop=True)
     st.write(f"符合條件 **{len(v)}** 檔")
     if v.empty:
         st.info("沒有符合的股票,試著降低「最少獨立樣本」或「勝率優勢」。")
@@ -1904,6 +1978,290 @@ def ai_advice(ctx, key):
         return "".join(b.text for b in r.content if b.type == "text")
     except Exception as e:
         return f"AI 解讀失敗:{e}"
+
+
+# ===================== 基本 / 財務(參考 Yahoo 奇摩股市) =====================
+def _fmt_date(x):
+    x = str(x or "").strip()
+    if re.fullmatch(r"\d{8}", x):
+        return f"{x[:4]}-{x[4:6]}-{x[6:]}"
+    if re.fullmatch(r"\d{7}", x):                       # 民國年 YYYMMDD
+        return f"{int(x[:3]) + 1911}-{x[3:5]}-{x[5:]}"
+    return x
+
+
+def _num(x):
+    try:
+        return float(str(x).replace(",", ""))
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _profile_rows(url):
+    r = requests.get(url, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    return r.json()
+
+
+def get_company_profile(code):
+    """公司基本資料:證交所(上市)/櫃買中心(上櫃)開放資料,內容與 Yahoo 奇摩股市「基本資料」相同來源。"""
+    def pick(d, *keys):
+        for k in keys:
+            v = d.get(k)
+            if v not in (None, "", "-"):
+                return str(v).strip()
+        return ""
+    for mkt, url, idk in (("上市", "https://openapi.twse.com.tw/v1/opendata/t187ap03_L", ("公司代號", "Code")),
+                          ("上櫃", "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",
+                           ("SecuritiesCompanyCode", "公司代號", "Code"))):
+        try:
+            rows = _profile_rows(url)
+        except Exception:
+            continue
+        for d in rows:
+            if pick(d, *idk) != code:
+                continue
+            return {"市場別": mkt,
+                    "公司全名": pick(d, "公司名稱", "CompanyName"),
+                    "董事長": pick(d, "董事長", "Chairman"),
+                    "總經理": pick(d, "總經理", "GeneralManager"),
+                    "發言人": pick(d, "發言人", "Spokesman"),
+                    "成立日期": _fmt_date(pick(d, "成立日期", "DateOfIncorporation")),
+                    "上市(櫃)日期": _fmt_date(pick(d, "上市日期", "上櫃日期", "DateOfListing")),
+                    "實收資本額": _num(pick(d, "實收資本額", "PaidinCapital")),
+                    "已發行股數": _num(pick(d, "已發行普通股數或TDR原發行股數", "IssueShares")),
+                    "總機電話": pick(d, "總機電話", "Telephone"),
+                    "地址": pick(d, "住址", "Address"),
+                    "網址": pick(d, "公司網址", "WebAddress"),
+                    "簽證會計師事務所": pick(d, "簽證會計師事務所", "CPAFirm")}
+    return {}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_yf_info(code):
+    keys = ("longBusinessSummary", "marketCap", "sharesOutstanding", "beta", "fullTimeEmployees", "website",
+            "phone", "city", "companyOfficers", "trailingEps", "bookValue", "sector", "industry")
+    for suf in (".TW", ".TWO"):
+        try:
+            i = yf.Ticker(code + suf).info
+            if i and (i.get("longName") or i.get("shortName") or i.get("marketCap")):
+                return {k: i.get(k) for k in keys}
+        except Exception:
+            pass
+    return {}
+
+
+def ai_translate(text, key):
+    try:
+        import anthropic
+        r = anthropic.Anthropic(api_key=key).messages.create(
+            model=MODEL, max_tokens=1200,
+            messages=[{"role": "user", "content": "請把下列公司簡介翻成流暢的繁體中文,只輸出譯文:\n\n" + text}])
+        return "".join(b.text for b in r.content if b.type == "text")
+    except Exception as e:
+        return f"翻譯失敗:{e}"
+
+
+def _pick_series(df, types, name_re=None):
+    """從 FinMind 長表(date,type,value,origin_name)取出一個科目的時間序列;先比 type,找不到再用中文科目名稱。"""
+    if df is None or df.empty or "type" not in df:
+        return pd.Series(dtype=float)
+    sub = df[df["type"].isin(types)]
+    if sub.empty and name_re and "origin_name" in df:
+        sub = df[df["origin_name"].astype(str).str.contains(name_re, regex=True, na=False)]
+    if sub.empty:
+        return pd.Series(dtype=float)
+    sub = sub.assign(value=pd.to_numeric(sub["value"], errors="coerce"))
+    return sub.groupby("date")["value"].first()
+
+
+def _qlabel(d):
+    return f"{d.year}Q{(d.month - 1) // 3 + 1}"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_income_q(code):
+    df = finmind("TaiwanStockFinancialStatements", code, 365 * 6)
+    spec = {"營業收入": (["Revenue"], r"^營業收入"), "營業成本": (["CostOfGoodsSold"], r"^營業成本"),
+            "毛利": (["GrossProfit"], r"^營業毛利"), "營業利益": (["OperatingIncome"], r"^營業利益"),
+            "稅前淨利": (["PreTaxIncome"], r"^稅前淨利"),
+            "稅後淨利": (["IncomeAfterTaxes"], r"^本期淨利|^本期稅後淨利"), "EPS": (["EPS"], r"每股盈餘")}
+    out = pd.DataFrame({k: _pick_series(df, t, rg) for k, (t, rg) in spec.items()}).sort_index()
+    if out.empty or out["營業收入"].dropna().empty:
+        return pd.DataFrame()
+    r = out["營業收入"]
+    out["毛利率%"] = out["毛利"] / r * 100
+    out["營業利益率%"] = out["營業利益"] / r * 100
+    out["稅後淨利率%"] = out["稅後淨利"] / r * 100
+    out["營收年增%"] = (r / r.shift(4) - 1) * 100
+    out["EPS年增%"] = np.where(out["EPS"].shift(4) > 0, (out["EPS"] / out["EPS"].shift(4) - 1) * 100, np.nan)
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_bs_q(code):
+    df = finmind("TaiwanStockBalanceSheet", code, 365 * 6)
+    spec = {"現金及約當現金": (["CashAndCashEquivalents"], r"^現金及約當現金"),
+            "流動資產": (["CurrentAssets"], r"^流動資產(合計|總計)"),
+            "總資產": (["TotalAssets"], r"^(資產總額|資產總計)"),
+            "流動負債": (["CurrentLiabilities"], r"^流動負債(合計|總計)"),
+            "總負債": (["Liabilities"], r"^(負債總額|負債總計)"),
+            "股東權益": (["Equity"], r"^(權益總額|權益總計)")}
+    out = pd.DataFrame({k: _pick_series(df, t, rg) for k, (t, rg) in spec.items()}).sort_index()
+    if out.empty or out["總資產"].dropna().empty:
+        return pd.DataFrame()
+    out["負債比率%"] = out["總負債"] / out["總資產"] * 100
+    out["流動比率%"] = out["流動資產"] / out["流動負債"] * 100
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_cf_q(code):
+    df = finmind("TaiwanStockCashFlowsStatement", code, 365 * 6)
+    spec = {"營業活動現金流": (["CashFlowsFromOperatingActivities", "NetCashInflowFromOperatingActivities",
+                              "CashProvidedByOperatingActivities"], r"^營業活動.*淨現金"),
+            "投資活動現金流": (["CashProvidedByInvestingActivities", "NetCashInflowFromInvestingActivities",
+                              "CashFlowsFromInvestingActivities"], r"^投資活動.*淨現金"),
+            "籌資活動現金流": (["CashProvidedByFinancingActivities", "CashFlowsProvidedFromFinancingActivities",
+                              "NetCashInflowFromFinancingActivities"], r"^籌資活動.*淨現金"),
+            "資本支出": (["PropertyAndPlantAndEquipment"], r"^取得不動產、廠房及設備"),
+            "期末現金": (["CashBalancesEndOfPeriod", "CashAndCashEquivalentsEndOfPeriod"], r"^期末現金")}
+    out = pd.DataFrame({k: _pick_series(df, t, rg) for k, (t, rg) in spec.items()}).sort_index()
+    if out.empty or out["營業活動現金流"].dropna().empty:
+        return pd.DataFrame()
+    out["自由現金流"] = out["營業活動現金流"] - out["資本支出"].abs()
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_month_rev(code):
+    mr = finmind("TaiwanStockMonthRevenue", code, 365 * 4)
+    if mr.empty or "revenue" not in mr:
+        return pd.DataFrame()
+    if {"revenue_year", "revenue_month"} <= set(mr.columns):
+        ym = pd.to_datetime(dict(year=pd.to_numeric(mr["revenue_year"]), month=pd.to_numeric(mr["revenue_month"]),
+                                 day=1)).dt.to_period("M")
+    else:
+        ym = mr["date"].dt.to_period("M") - 1
+    s = pd.Series(pd.to_numeric(mr["revenue"], errors="coerce").values, index=ym.values).sort_index()
+    s = s[~s.index.duplicated(keep="last")]
+    s = s.reindex(pd.period_range(s.index.min(), s.index.max(), freq="M"))
+    m = pd.DataFrame({"rev": s})
+    m["mom"] = s.pct_change(fill_method=None) * 100
+    m["yoy"] = (s / s.shift(12) - 1) * 100
+    m["cum"] = s.groupby(s.index.year).cumsum()
+    m["cum_yoy"] = (m["cum"] / m["cum"].shift(12) - 1) * 100
+    m.index = m.index.to_timestamp()
+    return m
+
+
+def _fmtv(v, kind):
+    if v is None or pd.isna(v):
+        return "—"
+    if kind == "e":                       # 元 → 億元
+        return f"{v / 1e8:,.2f}"
+    if kind == "p":
+        return f"{v:,.1f}%"
+    return f"{v:,.2f}"
+
+
+def _q_table(df, rows, n=8):
+    """以季為欄(最新在左)的財報表。rows=[(顯示名稱, 欄位, 格式 e/p/x)]"""
+    d = df.tail(n).iloc[::-1]
+    cols = [_qlabel(x) for x in d.index]
+    data = {lbl: [_fmtv(v, k) for v in d[c]] for lbl, c, k in rows if c in d}
+    return pd.DataFrame(data, index=cols).T
+
+
+# ---- Yahoo 奇摩股市「基本資料」頁(ETF 與個股補充資料)----
+YAHOO_LABELS = ["全名", "計價幣別", "投資地區", "交易所", "追蹤指數", "資產規模", "最高管理費率", "管理費率", "保管費率",
+                "發行公司", "成立日", "經理人", "公司電話", "公司地址", "網站",
+                "董事長", "總經理", "發言人", "成立日期", "上市日期", "上櫃日期", "實收資本額", "普通股數", "統一編號",
+                "產業別", "公司名稱",
+                "股利所屬期間", "現金股利", "現金股利發放日", "除息日期", "最後過戶日"]
+_YAHOO_STOP = ("配股資訊", "重要行事曆", "我的自選股", "網友也在看")
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def get_yahoo_profile(code):
+    """抓 Yahoo 奇摩股市「基本」頁:先把網頁轉成純文字行,再依已知欄位名稱取下一行當內容。回傳 (欄位dict, 網址)。"""
+    for suf in (".TW", ".TWO"):
+        url = f"https://tw.stock.yahoo.com/quote/{code}{suf}/profile"
+        try:
+            r = requests.get(url, timeout=15, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+                "Accept-Language": "zh-TW,zh;q=0.9"})
+            if r.status_code != 200:
+                continue
+            txt = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", r.text)
+            txt = _html.unescape(re.sub(r"(?s)<[^>]+>", "\n", txt))
+            lines = [l.strip() for l in txt.split("\n") if l.strip()]
+        except Exception:
+            continue
+        start = next((i for i, l in enumerate(lines) if l == "公司基本資料"), 0)
+        lines = lines[start:]
+
+        def label_of(l):
+            for lb in YAHOO_LABELS:
+                if l == lb or (lb == "資產規模" and l.startswith("資產規模")):
+                    return lb
+            return "資產規模" if l.startswith("資產規模") else None
+        out, i = {}, 0
+        while i < len(lines):
+            l = lines[i]
+            if l in ("我的自選股", "網友也在看"):
+                break
+            lb = "資產規模" if l.startswith("資產規模") else label_of(l)
+            if lb:
+                j = i + 1
+                val = ""
+                if j < len(lines) and label_of(lines[j]) is None and lines[j] not in _YAHOO_STOP:
+                    val = lines[j]
+                    if lb == "資產規模" and re.fullmatch(r"\d{4}/\d{2}/\d{2}", val) and j + 1 < len(lines):
+                        out.setdefault("資產規模資料日", val)
+                        val = lines[j + 1]
+                        j += 1
+                if val and val != "-":
+                    out.setdefault(lb, val)
+                i = j if val else i + 1
+            else:
+                i += 1
+        if out:
+            return out, url
+    return {}, f"https://tw.stock.yahoo.com/quote/{code}.TW/profile"
+
+
+def _kv_html(k, v, raw=False):
+    return (f'<div style="padding:.4rem 0;border-bottom:1px solid rgba(128,128,128,.25)">'
+            f'<span style="opacity:.65">{_html.escape(str(k))}</span><br>'
+            f'<b>{v if raw else _html.escape(str(v))}</b></div>')
+
+
+def _pct2(v):
+    """'0.3200%' → '0.32%'(取到小數第 2 位);不是純百分比數字(例如階梯式說明文字)就原樣回傳。"""
+    m = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*%\s*", str(v or ""))
+    return f"{float(m.group(1)):.2f}%" if m else v
+
+
+def _cards_html(items):
+    """items=[(標題, 內容, 副標或None)]:自動換行的卡片格,數字不會被截斷成「…」。"""
+    box = ('background:rgba(128,128,128,.12);border:1px solid rgba(128,128,128,.25);border-radius:12px;'
+           'padding:.7rem .9rem;min-width:0')
+    out = ['<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.6rem;margin:.3rem 0 .8rem">']
+    for lb, v, sub in items:
+        out.append(f'<div style="{box}"><div style="font-size:.8rem;opacity:.65">{_html.escape(str(lb))}</div>'
+                   f'<div style="font-size:1.15rem;font-weight:700;line-height:1.35;word-break:break-all">{_html.escape(str(v))}</div>'
+                   + (f'<div style="font-size:.8rem;opacity:.65;margin-top:.1rem">{_html.escape(str(sub))}</div>' if sub else '')
+                   + '</div>')
+    out.append('</div>')
+    return "".join(out)
+
+
+def _link_html(u):
+    u = str(u).strip()
+    h = u if u.startswith("http") else "http://" + u
+    return f'<a href="{_html.escape(h, quote=True)}" target="_blank" rel="noopener noreferrer">{_html.escape(u)}</a>'
 
 
 hero()
@@ -2119,8 +2477,8 @@ with st.expander("停損 / 停利規則:參考價位與歷史效果(賣出訊號
                     f"(累計 {_bst['累計報酬%']:+.0f}%、最大回撤 {_bst['最大回撤%']:.0f}%、{int(_bst['交易次數'])} 筆)。")
         st.caption("只代表這檔股票自己的歷史與這個進場範例,樣本不多時請保守看待;未計滑價與跳空風險,過去結果不保證未來。")
 
-tab1, tabLive, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-    ["總覽與建議", "即時走勢", "K線圖", "籌碼面", "估值", "回測", "新聞", "配息試算"])
+tab1, tabLive, tab2, tab3, tabBasic, tabFin, tab4, tab5, tab6, tab7 = st.tabs(
+    ["總覽與建議", "即時走勢", "K線圖", "籌碼面", "基本", "財務", "估值", "回測", "新聞", "配息試算"])
 
 with tab1:
     c1, c2, c3, c4 = st.columns(4)
@@ -2286,6 +2644,211 @@ with tab3:
         fig.update_layout(height=350, margin=dict(t=10))
         st.plotly_chart(fig, use_container_width=True)
         st.json(m_stats)
+
+with tabBasic:
+    prof, yi = get_company_profile(code), get_yf_info(code)
+    yp, yurl = get_yahoo_profile(code)
+    is_etf = str(industry).strip().upper() == "ETF" or (code.startswith("00") and not prof)
+    _px = float(df.Close.iloc[-1])
+    _h52 = _hd.tail(250) if not _hd.empty else pd.DataFrame()
+    _cur = per.iloc[-1] if not per.empty else None
+    st.markdown(f"[🔗 在 Yahoo 股市查看完整基本資料]({yurl})")
+
+    if is_etf:
+        _dt = get_div_table(code)
+        _ttm = div_summary(_dt)["ttm"] if not _dt.empty else None
+        _aum = _num(str(yp.get("資產規模", "")).replace(",", ""))           # Yahoo 單位:百萬元
+        st.markdown(_cards_html([
+            ("資產規模", f"{_aum / 100:,.0f} 億" if _aum else "—", yp.get("資產規模資料日")),
+            ("管理費率", _pct2(yp.get("管理費率", "—")), None),
+            ("近12個月配息", f"{_ttm:.2f} 元" if _ttm else "—", f"殖利率 {_ttm / _px * 100:.2f}%" if _ttm else None),
+            ("成立日", yp.get("成立日", "—"), None),
+            ("最高管理費率", _pct2(yp.get("最高管理費率", "—")), None),
+            ("52週最高", f"{_h52.High.max():.2f}" if not _h52.empty else "—", None),
+            ("52週最低", f"{_h52.Low.min():.2f}" if not _h52.empty else "—", None),
+            ("追蹤指數", yp.get("追蹤指數", "—"), None)]), unsafe_allow_html=True)
+
+        st.markdown("#### 基金基本資料")
+        if not yp:
+            st.warning("暫時抓不到 Yahoo 股市的基本資料(可能是網路或網站限制),請點上方連結查看。")
+        else:
+            _short = name or (live or {}).get("name") or yp.get("全名", "")
+            st.markdown(_kv_html("名稱", _short), unsafe_allow_html=True)
+            order = ["計價幣別", "投資地區", "交易所", "追蹤指數", "資產規模", "最高管理費率", "管理費率",
+                     "保管費率", "發行公司", "成立日", "經理人", "公司電話", "公司地址", "網站"]
+            cells = []
+            for k in order:
+                v = yp.get(k)
+                if not v:
+                    continue
+                if k in ("管理費率", "最高管理費率"):
+                    v = _pct2(v)
+                if k == "資產規模":
+                    k = f"資產規模(百萬){'  ' + yp['資產規模資料日'] if yp.get('資產規模資料日') else ''}"
+                cells.append(_kv_html(k, _link_html(v), raw=True) if k == "網站" else _kv_html(k, v))
+            half = (len(cells) + 1) // 2
+            ca, cb = st.columns(2)
+            ca.markdown("".join(cells[:half]), unsafe_allow_html=True)
+            cb.markdown("".join(cells[half:]), unsafe_allow_html=True)
+        cal = [(k, yp[k]) for k in ("股利所屬期間", "現金股利", "現金股利發放日", "除息日期", "最後過戶日") if yp.get(k)]
+        if cal:
+            st.markdown("#### 配息與重要行事曆")
+            st.markdown(_cards_html([({"除息日期": "除息日", "最後過戶日": "最後過戶日(除息)"}.get(k, k), v, None)
+                                     for k, v in cal]), unsafe_allow_html=True)
+        st.caption("資料來源:Yahoo 股市(精誠資訊提供)、FinMind、Yahoo Finance;ETF 沒有本益比與財報,故不顯示。")
+    else:
+        _shares = prof.get("已發行股數") or yi.get("sharesOutstanding")
+        _mcap = _px * _shares if _shares else yi.get("marketCap")
+        _iq = get_income_q(code)
+        _ttm_eps = float(_iq["EPS"].dropna().tail(4).sum()) if not _iq.empty and _iq["EPS"].dropna().size >= 4 else None
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("市值", f"{_mcap / 1e8:,.0f} 億" if _mcap else "—")
+        m2.metric("本益比", f"{float(_cur.PER):.1f}" if _cur is not None and float(_cur.PER) > 0 else "—")
+        m3.metric("股價淨值比", f"{float(_cur.PBR):.2f}" if _cur is not None and float(_cur.PBR) > 0 else "—")
+        m4.metric("殖利率", f"{float(_cur.dividend_yield):.2f}%" if _cur is not None and float(_cur.dividend_yield) > 0 else "—")
+        m5, m6, m7, m8 = st.columns(4)
+        m5.metric("近四季 EPS", f"{_ttm_eps:.2f} 元" if _ttm_eps is not None else "—")
+        m6.metric("52週最高", f"{_h52.High.max():.2f}" if not _h52.empty else "—")
+        m7.metric("52週最低", f"{_h52.Low.min():.2f}" if not _h52.empty else "—")
+        m8.metric("Beta", f"{yi['beta']:.2f}" if yi.get("beta") else "—")
+
+        st.markdown("#### 公司資料")
+        g = lambda k, *alts: prof.get(k) or next((yp[a] for a in (k,) + alts if yp.get(a)), "")   # 證交所資料優先,缺的用 Yahoo 補
+        if not prof and not yi and not yp:
+            st.warning("查不到公司基本資料(新上市或資料來源暫時無法連線)。")
+        else:
+            items = [("代號 / 名稱", f"{code} {name or g('公司全名', '公司名稱')}"), ("公司全名", g("公司全名", "公司名稱")),
+                     ("市場別", prof.get("市場別", "")), ("產業別", industry or yi.get("industry") or yp.get("產業別", "")),
+                     ("董事長", g("董事長")), ("總經理", g("總經理")), ("發言人", g("發言人")),
+                     ("成立日期", g("成立日期")), ("上市(櫃)日期", prof.get("上市(櫃)日期") or yp.get("上市日期") or yp.get("上櫃日期", "")),
+                     ("實收資本額", f"{prof['實收資本額'] / 1e8:,.2f} 億元" if prof.get("實收資本額") else yp.get("實收資本額", "")),
+                     ("已發行股數", f"{prof['已發行股數'] / 1e8:,.2f} 億股" if prof.get("已發行股數") else yp.get("普通股數", "")),
+                     ("員工人數", f"{int(yi['fullTimeEmployees']):,} 人" if yi.get("fullTimeEmployees") else ""),
+                     ("總機電話", prof.get("總機電話") or yi.get("phone") or yp.get("公司電話", "")),
+                     ("地址", prof.get("地址") or yp.get("公司地址") or yi.get("city") or ""),
+                     ("簽證會計師", prof.get("簽證會計師事務所", ""))]
+            items = [(k, v) for k, v in items if str(v).strip()]
+            cells = [_kv_html(k, v) for k, v in items]
+            site = prof.get("網址") or yi.get("website") or yp.get("網站") or ""
+            if site:
+                cells.append(_kv_html("公司網址", _link_html(site), raw=True))
+            ca, cb = st.columns(2)
+            for n_, c_ in enumerate(cells):
+                (ca if n_ % 2 == 0 else cb).markdown(c_, unsafe_allow_html=True)
+            if not g("董事長") and yi.get("companyOfficers"):
+                offs = [f"{o.get('name', '')}({o.get('title', '')})" for o in yi["companyOfficers"][:5] if o.get("name")]
+                if offs:
+                    st.markdown("**主要經理人**:" + "、".join(offs))
+
+        if yi.get("longBusinessSummary"):
+            with st.expander("公司簡介(來源 Yahoo Finance,原文為英文)"):
+                _zk = f"sum_zh_{code}"
+                if st.session_state.get(_zk):
+                    st.write(st.session_state[_zk])
+                else:
+                    st.write(yi["longBusinessSummary"])
+                    if api_key and st.button("🌐 用 AI 翻成中文", key=f"zh_{code}"):
+                        with st.spinner("翻譯中…"):
+                            st.session_state[_zk] = ai_translate(yi["longBusinessSummary"], api_key)
+                        st.rerun()
+        st.caption("資料來源:證交所/櫃買中心公開資料、Yahoo 股市、FinMind、Yahoo Finance;與 Yahoo 奇摩股市顯示的數字可能略有時間差。")
+
+with tabFin:
+    t_rev, t_inc, t_bs, t_cf = st.tabs(["月營收", "損益與獲利", "資產負債", "現金流量"])
+
+    with t_rev:
+        mrv = get_month_rev(code)
+        if mrv.empty:
+            st.warning("查不到月營收(ETF 沒有營收,或資料來源暫時無法連線)。")
+        else:
+            lm = mrv.dropna(subset=["rev"]).iloc[-1]
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric(f"最新月營收({mrv.dropna(subset=['rev']).index[-1]:%Y-%m})", f"{lm.rev / 1e8:,.2f} 億",
+                      f"年增 {lm.yoy:+.1f}%" if pd.notna(lm.yoy) else None)
+            r2.metric("月增率", f"{lm.mom:+.1f}%" if pd.notna(lm.mom) else "—")
+            r3.metric("今年累計營收", f"{lm.cum / 1e8:,.2f} 億")
+            r4.metric("累計年增率", f"{lm.cum_yoy:+.1f}%" if pd.notna(lm.cum_yoy) else "—")
+            g = mrv.tail(24)
+            fig = make_subplots(specs=[[{"secondary_y": True}]])
+            fig.add_trace(go.Bar(x=g.index.strftime("%Y-%m"), y=g.rev / 1e8, name="月營收(億)"), secondary_y=False)
+            fig.add_trace(go.Scatter(x=g.index.strftime("%Y-%m"), y=g.yoy, name="年增率%", mode="lines+markers"),
+                          secondary_y=True)
+            fig.update_layout(height=380, margin=dict(t=10), legend=dict(orientation="h"))
+            st.plotly_chart(fig, use_container_width=True)
+            tb = mrv.dropna(subset=["rev"]).tail(18).iloc[::-1]
+            st.dataframe(pd.DataFrame({"月份": tb.index.strftime("%Y-%m"), "月營收(億)": [_fmtv(v, "e") for v in tb.rev],
+                                       "月增%": [_fmtv(v, "p") for v in tb.mom], "年增%": [_fmtv(v, "p") for v in tb.yoy],
+                                       "累計營收(億)": [_fmtv(v, "e") for v in tb.cum],
+                                       "累計年增%": [_fmtv(v, "p") for v in tb.cum_yoy]}),
+                         hide_index=True, use_container_width=True)
+
+    with t_inc:
+        iq = get_income_q(code)
+        if iq.empty:
+            st.warning("查不到損益表(ETF 沒有財報,或資料來源暫時無法連線)。")
+        else:
+            e1, e2, e3, e4 = st.columns(4)
+            _e4 = iq["EPS"].dropna().tail(4)
+            e1.metric("近四季 EPS", f"{_e4.sum():.2f} 元" if len(_e4) == 4 else "—")
+            e2.metric("最新季 EPS", f"{iq['EPS'].dropna().iloc[-1]:.2f} 元" if iq["EPS"].notna().any() else "—")
+            e3.metric("最新季毛利率", _fmtv(iq["毛利率%"].dropna().iloc[-1], "p") if iq["毛利率%"].notna().any() else "—")
+            e4.metric("最新季營益率", _fmtv(iq["營業利益率%"].dropna().iloc[-1], "p") if iq["營業利益率%"].notna().any() else "—")
+            g = iq.tail(12)
+            lb = [_qlabel(x) for x in g.index]
+            fig = make_subplots(specs=[[{"secondary_y": True}]])
+            fig.add_trace(go.Bar(x=lb, y=g["營業收入"] / 1e8, name="營收(億)"), secondary_y=False)
+            for c_ in ("毛利率%", "營業利益率%", "稅後淨利率%"):
+                fig.add_trace(go.Scatter(x=lb, y=g[c_], name=c_, mode="lines+markers"), secondary_y=True)
+            fig.update_layout(height=380, margin=dict(t=10), legend=dict(orientation="h"))
+            st.plotly_chart(fig, use_container_width=True)
+            fig2 = go.Figure(go.Bar(x=lb, y=g["EPS"], name="EPS(元)"))
+            fig2.update_layout(height=260, margin=dict(t=10), yaxis_title="EPS(元)")
+            st.plotly_chart(fig2, use_container_width=True)
+            st.dataframe(_q_table(iq, [("營業收入(億)", "營業收入", "e"), ("營收年增%", "營收年增%", "p"),
+                                       ("毛利(億)", "毛利", "e"), ("營業利益(億)", "營業利益", "e"),
+                                       ("稅前淨利(億)", "稅前淨利", "e"), ("稅後淨利(億)", "稅後淨利", "e"),
+                                       ("毛利率", "毛利率%", "p"), ("營業利益率", "營業利益率%", "p"),
+                                       ("稅後淨利率", "稅後淨利率%", "p"), ("EPS(元)", "EPS", "x"),
+                                       ("EPS年增%", "EPS年增%", "p")]), use_container_width=True)
+            st.caption("單季數字,最新季在左;稅後淨利為合併損益表本期淨利(含少數股權),與 EPS 對應的歸屬母公司淨利可能略有差異。")
+
+    with t_bs:
+        bs = get_bs_q(code)
+        if bs.empty:
+            st.warning("查不到資產負債表(ETF 沒有財報,或資料來源暫時無法連線)。")
+        else:
+            b = bs.dropna(subset=["總資產"]).iloc[-1]
+            b1, b2, b3, b4 = st.columns(4)
+            b1.metric("總資產", f"{b['總資產'] / 1e8:,.0f} 億")
+            b2.metric("負債比率", _fmtv(b["負債比率%"], "p"))
+            b3.metric("流動比率", _fmtv(b["流動比率%"], "p"))
+            b4.metric("股東權益", f"{b['股東權益'] / 1e8:,.0f} 億" if pd.notna(b["股東權益"]) else "—")
+            g = bs.tail(8)
+            lb = [_qlabel(x) for x in g.index]
+            fig = go.Figure([go.Bar(x=lb, y=g["總資產"] / 1e8, name="總資產"),
+                             go.Bar(x=lb, y=g["總負債"] / 1e8, name="總負債"),
+                             go.Bar(x=lb, y=g["股東權益"] / 1e8, name="股東權益")])
+            fig.update_layout(barmode="group", height=320, margin=dict(t=10), yaxis_title="億元",
+                              legend=dict(orientation="h"))
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(_q_table(bs, [("現金及約當現金(億)", "現金及約當現金", "e"), ("流動資產(億)", "流動資產", "e"),
+                                       ("總資產(億)", "總資產", "e"), ("流動負債(億)", "流動負債", "e"),
+                                       ("總負債(億)", "總負債", "e"), ("股東權益(億)", "股東權益", "e"),
+                                       ("負債比率", "負債比率%", "p"), ("流動比率", "流動比率%", "p")]),
+                         use_container_width=True)
+
+    with t_cf:
+        cf = get_cf_q(code)
+        if cf.empty:
+            st.warning("查不到現金流量表(ETF 沒有財報,或資料來源暫時無法連線)。")
+        else:
+            st.dataframe(_q_table(cf, [("營業活動現金流(億)", "營業活動現金流", "e"),
+                                       ("投資活動現金流(億)", "投資活動現金流", "e"),
+                                       ("籌資活動現金流(億)", "籌資活動現金流", "e"),
+                                       ("資本支出(億)", "資本支出", "e"), ("自由現金流(億)", "自由現金流", "e"),
+                                       ("期末現金(億)", "期末現金", "e")]), use_container_width=True)
+            st.caption("現金流量表為當年度累計數(Q2 = 上半年累計、Q4 = 全年),不是單季;自由現金流 = 營業活動現金流 − 資本支出。")
+    st.caption("資料來源:FinMind(公開資訊觀測站財報);單位為億元,與 Yahoo 奇摩股市的數字可能略有出入。")
 
 with tab4:
     if per.empty:
