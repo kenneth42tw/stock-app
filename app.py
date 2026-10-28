@@ -2365,11 +2365,11 @@ with tab5:
 with tab6:
     for n in sorted(news, key=lambda x: x.get("ts", 0), reverse=True):
         _t, _u = _html.escape(n["title"]), _html.escape(n["link"], quote=True)
-        # 網頁版:新分頁開啟;手機 App(WebView/PWA)常擋 target=_blank,因此另附 target=_top 連結(跳出 iframe,避免新聞網站 X-Frame-Options 擋下)
+        # 標題直接連結;App(WebView)端由 onCreateWindow 攔截 target=_blank 後改用系統瀏覽器開啟
         st.markdown(
             f'<div style="margin:0 0 .8rem 0">'
             f'<a href="{_u}" target="_blank" rel="noopener noreferrer">{_t}</a><br>'
-            f'<small>{n["date"]} ｜ <a href="{_u}" target="_top" rel="noopener noreferrer">📱 App 點這裡開啟</a></small></div>',
+            f'<small>{n["date"]}</small></div>',
             unsafe_allow_html=True)
     if not news:
         st.write("沒有抓到新聞")
