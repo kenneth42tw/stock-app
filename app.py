@@ -1662,6 +1662,22 @@ def _back_to_multi():
     st.session_state["mode"] = "多股同時分析"
 
 
+PAPER_MODE = "模擬交易"
+
+
+def render_paper():
+    """「模擬交易」模式:把 paper_dashboard.py(模擬帳戶 / 手動回測 / 自動優化 / 目前策略參數)直接內嵌在本頁。
+    paper_dashboard.py 要和本檔放在同一個資料夾,並且和 paper_live / paper_trade 等模組一起。"""
+    try:
+        import paper_dashboard as PD
+    except Exception as e:                       # noqa: BLE001
+        st.error(f"載入模擬交易失敗:{e}")
+        st.caption("請確認 paper_dashboard.py、paper_live.py、paper_trade.py、paper_optimize.py、paper_manual.py、"
+                   "paper_ui.py、strategy_rules.py 都和 app.py 放在同一個資料夾。")
+        return
+    PD.main(embedded=True)
+
+
 def render_multi(stocks, th):
     st.subheader("📊 多股同時分析")
     if not stocks:
@@ -2591,7 +2607,8 @@ def _apply_locks(L):
     ss["_lock_ver"] = ss.get("_lock_ver", 0) + 1
 
 
-hero()
+if st.session_state.get("mode") != PAPER_MODE:
+    hero()
 try:   # 讀取瀏覽器裡的鎖定資料(失敗也不影響程式)
     _stored = _lock_component()(write=st.session_state.get("_ls_write"), token=st.session_state.get("_ls_token", 0),
                                  key="kk_lock_store", default=None)
@@ -2602,7 +2619,11 @@ except Exception:
     pass
 st.session_state.setdefault("_locks", {})
 with st.sidebar:
-    mode = st.radio("模式", ["單一股票", "多股同時分析", "全市場勝率掃描"], horizontal=True, key="mode")
+    mode = st.radio("模式", ["單一股票", "多股同時分析", "全市場勝率掃描", PAPER_MODE], horizontal=True, key="mode")
+if mode == PAPER_MODE:
+    render_paper()
+    st.stop()
+with st.sidebar:
     stock_list = get_stock_list()
     code, name, industry, multi_list = "", "", "", []
     if mode == "單一股票":
@@ -2844,7 +2865,7 @@ def render_strategy_card(code, name, industry, hd):
     """單股頁:套用「目前採用參數」(手動指定 > 最佳化 > 內建預設)的策略判斷,逐條列出條件有沒有過。"""
     st.subheader("🧭 策略判斷(依目前採用參數)")
     if SR is None:
-        st.caption("找不到 strategy_rules.py(請與 app1.py 放在同一個資料夾),略過策略判斷。")
+        st.caption("找不到 strategy_rules.py(請與 app.py 放在同一個資料夾),略過策略判斷。")
         return
     R = SR.resolve_params()
     P = R["P"]
