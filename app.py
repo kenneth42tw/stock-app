@@ -57,6 +57,14 @@ import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
 
+_here = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else "."
+if _here not in sys.path:
+    sys.path.insert(0, _here)
+try:
+    import strategy_rules as SR          # 與模擬交易共用的策略規則(要和本檔放同一個資料夾)
+except Exception:                        # noqa: BLE001
+    SR = None
+
 st.set_page_config(page_title="台股分析儀表板", page_icon="📈", layout="wide", initial_sidebar_state="auto")
 FINMIND = "https://api.finmindtrade.com/api/v4/data"
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
@@ -576,6 +584,96 @@ def score_val(per, divs=None, price=None):
     return s, notes, {"本益比": cur.PER, "股價淨值比": cur.PBR, "殖利率%": cur.dividend_yield, "PER分位%": None if pct != pct else round(pct)}
 
 
+# ------------------------------------------------------------------ 同業估值:貴 / 合理 / 便宜 與價格區間
+def _fnum(x):
+    try:
+        v = float(str(x).replace(",", "").replace("%", "").strip())
+        return v if np.isfinite(v) else None
+    except (TypeError, ValueError):
+        return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def market_valuation():
+    """全市場最新本益比 / 股價淨值比 / 殖利率:證交所(上市)+ 櫃買中心(上櫃)開放資料。回傳 DataFrame(code, pe, pb, dy, mkt),抓不到回空表。"""
+    def pick(d, *ks):
+        for k in ks:
+            v = d.get(k)
+            if v not in (None, "", "-"):
+                return v
+        return None
+    out = []
+    for mkt, url, ck, pk, bk, yk in (
+            ("上市", "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", ("Code", "證券代號"), ("PEratio", "本益比"), ("PBratio", "股價淨值比"), ("DividendYield", "殖利率(%)")),
+            ("上櫃", "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", ("SecuritiesCompanyCode", "股票代號", "Code"),
+             ("PriceEarningRatio", "本益比", "PEratio"), ("PriceBookRatio", "股價淨值比", "PBratio"), ("YieldRatio", "殖利率(%)", "DividendYield"))):
+        try:
+            rows = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"}).json()
+        except Exception:
+            continue
+        for d in rows if isinstance(rows, list) else []:
+            c = str(pick(d, *ck) or "").strip()
+            if re.fullmatch(r"[1-9]\d{3}", c):
+                out.append(dict(code=c, pe=_fnum(pick(d, *pk)), pb=_fnum(pick(d, *bk)), dy=_fnum(pick(d, *yk)), mkt=mkt))
+    return pd.DataFrame(out, columns=["code", "pe", "pb", "dy", "mkt"])
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def peer_table(code, industry):
+    """同產業(不含自己)的最新本益比 / 淨值比。先用全市場開放資料;抓不到才退回 FinMind 逐檔查(最多 15 檔,較慢)。
+    回傳 (DataFrame(code, name, pe, pb), 資料來源說明)。"""
+    sl = get_stock_list()
+    if sl.empty or not industry:
+        return pd.DataFrame(columns=["code", "name", "pe", "pb"]), "查不到產業別"
+    peers = sl[(sl.industry_category == industry) & (sl.stock_id != code) & sl.stock_id.str.fullmatch(r"[1-9]\d{3}")]
+    mv = market_valuation()
+    if len(mv):
+        t = peers.merge(mv, left_on="stock_id", right_on="code")[["stock_id", "stock_name", "pe", "pb"]]
+        t.columns = ["code", "name", "pe", "pb"]
+        return t.reset_index(drop=True), "證交所/櫃買中心開放資料(最新交易日)"
+    rows = []
+    for _, r in peers.head(15).iterrows():
+        p = finmind("TaiwanStockPER", r.stock_id, 15)
+        if not p.empty:
+            rows.append(dict(code=r.stock_id, name=r.stock_name, pe=_fnum(p.PER.iloc[-1]), pb=_fnum(p.PBR.iloc[-1])))
+    return pd.DataFrame(rows, columns=["code", "name", "pe", "pb"]), "FinMind 逐檔查詢(只取同業前 15 檔,樣本較少)"
+
+
+def peer_fair_value(px_now, px_ref, pe, pb, peers, industry="", min_peers=5):
+    """用同業倍數推算合理價區間。
+    px_now = 現價;px_ref = 本益比/淨值比那一天的收盤價(用來反推每股盈餘、每股淨值);pe / pb = 這檔目前的倍數;peers = DataFrame(pe, pb)。
+    每個方法:便宜價 = 每股基準 × 同業 25% 分位倍數,貴價 = 每股基準 × 同業 75% 分位倍數,合理 = 兩者之間;中位數倍數為「同業中位估價」。
+    金融業只用淨值比(本益比僅供參考);其他產業兩個方法取平均。回傳 dict(methods, notes, combined)。"""
+    out = dict(methods=[], notes=[], combined=None)
+    fin = "金融" in (industry or "") or "保險" in (industry or "")
+    for key, label, mult, col, cap in (("PE", "本益比(PE)", pe, "pe", 100.0), ("PB", "股價淨值比(PB)", pb, "pb", 30.0)):
+        if not mult or mult <= 0:
+            out["notes"].append(f"{label}:這檔目前沒有有效數字(虧損或無資料),這個方法不使用。")
+            continue
+        ser = pd.to_numeric(peers[col], errors="coerce") if len(peers) else pd.Series(dtype=float)
+        ser = ser[(ser > 0) & np.isfinite(ser)].clip(upper=cap)
+        if len(ser) < min_peers:
+            out["notes"].append(f"{label}:同業有效樣本只有 {len(ser)} 檔(少於 {min_peers}),這個方法不使用。")
+            continue
+        base = px_ref / mult                                   # 每股盈餘(PE)或每股淨值(PB),以反推
+        lo, md, hi = (float(ser.quantile(q)) for q in (0.25, 0.5, 0.75))
+        cur = px_now / base
+        m = dict(key=key, label=label, base=base, cur=cur, q25=lo, q50=md, q75=hi, n=int(len(ser)), cheap=base * lo, mid=base * md, exp=base * hi,
+                 pct=float((ser <= cur).mean() * 100), used=not (fin and key == "PE"))
+        m["verdict"] = "便宜" if px_now < m["cheap"] else "貴" if px_now > m["exp"] else "合理"
+        out["methods"].append(m)
+    used = [m for m in out["methods"] if m["used"]]
+    if fin and any(m["key"] == "PE" for m in out["methods"]):
+        out["notes"].append("金融保險業的獲利受投資損益影響大,本益比波動大,合理價只用股價淨值比。")
+    if used:
+        c = {k: float(np.mean([m[k] for m in used])) for k in ("cheap", "mid", "exp")}
+        c["verdict"] = "便宜" if px_now < c["cheap"] else "貴" if px_now > c["exp"] else "合理"
+        c["methods"] = [m["key"] for m in used]
+        c["gap_mid"] = (px_now / c["mid"] - 1) * 100
+        out["combined"] = c
+    return out
+
+
 def backtest(df, score, buy_th, sell_th, fee=0.001425, tax=0.003):
     cur, pos = 0, []
     for s in score.values:
@@ -818,6 +916,66 @@ def streak(series):
     return sg, n, tot
 
 
+INST_WHO = ("外資", "投信", "三大法人")
+
+
+def inst_all(inst):
+    """把 prep_inst 的結果整理成:外資 / 投信 / 自營商 / 三大法人 的每日淨買賣超(張)。"""
+    if inst is None or len(inst) == 0:
+        return pd.DataFrame()
+    S = pd.DataFrame({k: (inst[k] if k in inst else pd.Series(0.0, index=inst.index))
+                      for k in ("外資", "投信", "自營商")})
+    S["三大法人"] = S.sum(axis=1)
+    return S.sort_index()
+
+
+def inst_streak_backtest(hd, S, who, n_now=0, big=5.0, horizons=(1, 5, 10, 20), base_ns=(1, 2, 3, 5, 7, 10)):
+    """法人連續買超/賣超「第 N 天」之後,股價的歷史漲跌機率。
+    - 持有 1 日 = 「隔天」的漲跌幅(隔天收盤 vs 當天收盤)。
+    - 持有 5/10/20 日:法人資料盤後才公布,假設隔日開盤進場,持有到第 h 個交易日收盤。
+    - 事件只算「剛好連續第 N 天」那一天;事件間隔至少 h 天,避免重疊樣本重複計算。
+    - 大漲/大跌 = 報酬 >= +big% / <= -big%;基準 = 同期間任意一天的機率。"""
+    if S is None or S.empty or who not in S or hd is None or hd.empty:
+        return None
+    d = hd[hd.index >= S.index.min()]
+    if len(d) < 250:
+        return None
+    stk = sstreak(S[who].reindex(d.index).fillna(0.0)).values
+    entry = d.Open.shift(-1)
+    ns = sorted(set(base_ns) | ({min(int(n_now), 20)} if n_now > 0 else set()))
+    base, rows = {}, []
+    for h in horizons:
+        if h == 1:
+            fwd = ((d.Close.shift(-1) / d.Close - 1) * 100).values
+        else:
+            fwd = ((d.Close.shift(-h) / entry - 1) * 100).values
+        ok = ~np.isnan(fwd)
+        if not ok.any():
+            continue
+        f0 = fwd[ok]
+        base[h] = dict(n=int(ok.sum()), rise=float((f0 > 0).mean() * 100), fall=float((f0 < 0).mean() * 100),
+                       down=float((f0 <= -big).mean() * 100), up=float((f0 >= big).mean() * 100),
+                       mean=float(f0.mean()), worst=float(f0.min()))
+        for sg, lab in ((-1, "連續賣超"), (1, "連續買超")):
+            for n in ns:
+                keep, last = [], -10 ** 9
+                for p in np.flatnonzero((stk == sg * n) & ok):
+                    if p - last >= h:
+                        keep.append(p)
+                        last = p
+                if not keep:
+                    continue
+                r = fwd[keep]
+                rows.append({"方向": lab, "連續天數": n, "持有天數": h, "次數": len(r),
+                             "上漲機率%": (r > 0).mean() * 100, "下跌機率%": (r < 0).mean() * 100,
+                             "大跌機率%": (r <= -big).mean() * 100, "大漲機率%": (r >= big).mean() * 100,
+                             "平均報酬%": r.mean(), "中位數%": float(np.median(r)), "最差單次%": float(r.min()),
+                             "可信度": "樣本太少" if len(r) < 10 else "僅供參考" if len(r) < 30 else "尚可"})
+    if not rows:
+        return None
+    return dict(base=base, table=pd.DataFrame(rows), big=big, start=d.index[0], years=len(d) / 245)
+
+
 def push_telegram(text):
     tok, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
     if tok and chat:
@@ -833,7 +991,11 @@ def _line_state():
 
 
 def push_line(text):
+    #return "LINE:已強制關閉"  # <--- 加上這行，絕對不會發送任何 LINE
+  
+  
     tok = os.environ.get("LINE_CHANNEL_TOKEN")
+   
     if not tok:
         return "LINE:未設定"
     stt = _line_state()
@@ -1705,8 +1867,28 @@ def detect_line_shape(hd, lookback=100):
         return "盤整"
 
 
-def scan_market(uni, guess, horizon, period, min_amt, progress, batch=40, use_live=True):
-    """逐批下載 → 對每檔跑 situation_stats(沿用單股「歷史相似情境」同一套邏輯)→ 回傳結果表"""
+def _scan_strategy(P, r, hd):
+    """依「目前採用參數」P 判斷這檔最新一根 K 棒是否符合買進條件(與單股『策略判斷』、模擬交易同一套規則)。
+    回傳要併入掃描結果的欄位;SR 不存在、參數為空或算不出來時,視為不符合。"""
+    out = {"符合買入策略": False, "策略觸發訊號": "", "策略勝率下限%": np.nan, "策略勝率優勢%": np.nan}
+    if SR is None or P is None:
+        return out
+    try:
+        sigs = sorted(set(SR.NEED_SIGS) | P["buy"] | P["block"] | P["exit"])
+        row = dict(stock_id=r["stock_id"], stock_name=r["stock_name"], industry_category=r.get("industry_category") or "")
+        s = SR.prepare_stock(row, hd, dict(build_signals=build_signals, tech_components=tech_components), sigs)
+        c = SR.entry_candidate(P, s, len(s["C"]) - 1)
+    except Exception:                                      # noqa: BLE001
+        return out
+    if c is not None:
+        out.update({"符合買入策略": True, "策略觸發訊號": "、".join(f"{b} {SR.SIGN_NAME.get(b, '')}".strip() for b in c[2]),
+                    "策略勝率下限%": float(c[0]), "策略勝率優勢%": float(c[1])})
+    return out
+
+
+def scan_market(uni, guess, horizon, period, min_amt, progress, batch=40, use_live=True, P=None):
+    """逐批下載 → 對每檔跑 situation_stats(沿用單股「歷史相似情境」同一套邏輯)→ 回傳結果表。
+    P 為策略參數(目前採用參數);有給就同時判斷每檔是否符合買進條件。"""
     rows, rec = [], uni.to_dict("records")
     for b in range(0, len(rec), batch):
         part = rec[b:b + batch]
@@ -1734,7 +1916,7 @@ def scan_market(uni, guess, horizon, period, min_amt, progress, batch=40, use_li
             if not SS:
                 continue
             t = SS["table"].iloc[0]
-            rows.append({"代碼": r["stock_id"], "名稱": r["stock_name"], "產業": r["industry_category"],
+            rows.append({**_scan_strategy(P, r, hd), "代碼": r["stock_id"], "名稱": r["stock_name"], "產業": r["industry_category"],
                          "現價": float(hd.Close.iloc[-1]), "近20日均成交值(百萬)": amt / 1e6,
                          "技術分數": SS["score"], "技術線型": detect_line_shape(hd),
                          "季線": "之上" if SS["above"] else "之下", "RSI區間": SS["zone"],
@@ -1763,8 +1945,12 @@ def render_scan():
     if uni.empty:
         st.error("股票清單載入失敗,請稍後再試。")
         return
+    R = SR.resolve_params() if SR is not None else None          # 目前採用參數:手動指定 > 最新最佳化 > 內建預設
+    SP = R["P"] if R else None
+    import hashlib
+    ph = hashlib.md5(json.dumps(SR.to_jsonable(SP), sort_keys=True).encode()).hexdigest()[:8] if SP else "none"
     os.makedirs(SCAN_DIR, exist_ok=True)
-    fn = os.path.join(SCAN_DIR, f"scan_v4_{datetime.now():%Y%m%d}_L{int(use_live)}_{'live' if market_open() else 'close'}_{horizon}_{period}_{int(min_amt)}_{int(inc_etf)}.pkl")
+    fn = os.path.join(SCAN_DIR, f"scan_v5_{datetime.now():%Y%m%d}_L{int(use_live)}_{'live' if market_open() else 'close'}_{horizon}_{period}_{int(min_amt)}_{int(inc_etf)}_{ph}.pkl")
     st.caption(f"掃描範圍約 {len(uni)} 檔。第一次掃描需下載全部歷史股價,約數分鐘到十幾分鐘;同參數當天掃過會直接讀快取。")
     cA, cB = st.columns([1, 1])
     run = cA.button("▶ 開始掃描(使用今日快取)", type="primary")
@@ -1774,12 +1960,13 @@ def render_scan():
             st.session_state["scan_res"] = pd.read_pickle(fn)
         else:
             prog = st.progress(0.0, text="準備下載…")
-            res = scan_market(uni, guess, horizon, period, min_amt, prog, use_live=use_live)
+            res = scan_market(uni, guess, horizon, period, min_amt, prog, use_live=use_live, P=SP)
             prog.empty()
             if not res.empty:
                 res.to_pickle(fn)
             st.session_state["scan_res"] = res
-        st.session_state["scan_meta"] = dict(h=horizon, t=datetime.now().strftime("%Y-%m-%d %H:%M"))
+        st.session_state["scan_meta"] = dict(h=horizon, t=datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                             strat=(f"{R['label']}:{SR.param_text(SP)}" if R else ""), ph=ph)
     res = st.session_state.get("scan_res")
     if res is None:
         st.info("按下「開始掃描」。")
@@ -1804,15 +1991,36 @@ def render_scan():
         v = v[v["產業"].isin(pick_ind)]
     if only_pos:
         v = v[(v["平均報酬%"] > 0) & (v["中位數%"] > 0)]
+    STRAT = "買入策略(依目前採用參數)"
     sort_by = st.selectbox("排序依據", ["勝率下限%(最保守,建議)", "勝率%", "勝率優勢%", "平均報酬%",
-                                    "技術線型(W底往上優先)"], index=0,
-                           help="技術線型:W底突破 → W底頸線待突破 → W底右腳上揚 → W底打底中 → 多頭排列 → 盤整 → 空頭排列;同線型內再依勝率下限由高到低。")
-    if sort_by.startswith("技術線型"):
+                                    "技術線型(W底往上優先)"] + ([STRAT] if SR is not None else []), index=0,
+                           help="技術線型:W底突破 → W底頸線待突破 → W底右腳上揚 → W底打底中 → 多頭排列 → 盤整 → 空頭排列;同線型內再依勝率下限由高到低。\n"
+                                "買入策略:只列出符合「目前採用參數」買進條件的股票(與單股頁『策略判斷』同一套),依策略勝率下限由高到低;此選項不套用上方的滑桿篩選。")
+    if sort_by == STRAT:
+        if "符合買入策略" not in res.columns:
+            st.info("這份掃描結果是舊版,沒有策略判斷資料,請按「🔄 強制重新掃描」。")
+            return
+        if meta.get("ph") not in (None, ph):
+            st.warning("「目前採用參數」在掃描之後被更換過,下面的策略判斷是用掃描當時的參數。請按「▶ 開始掃描」用新參數重新判斷。")
+        st.caption(f"策略:{meta.get('strat') or (R['label'] + ':' + SR.param_text(SP))}"
+                   + (f"  ·  驗證結果:{R['verdict']}" if R else "") + "。訊號不含法人資料,與模擬交易一致。")
+        v = res[res["符合買入策略"] == True]                       # noqa: E712
+        if pick_ind:
+            v = v[v["產業"].isin(pick_ind)]
+        v = v.sort_values(["策略勝率下限%", "策略勝率優勢%"], ascending=False).reset_index(drop=True)
+        if v.empty:
+            st.write("符合買入策略的股票:**無**")
+            return
+        st.write(f"符合買入策略 **{len(v)}** 檔")
+        first = ["代碼", "名稱", "產業", "現價", "策略觸發訊號", "策略勝率下限%", "策略勝率優勢%"]
+        v = v[first + [c for c in v.columns if c not in first + ["符合買入策略"]]]
+    elif sort_by.startswith("技術線型"):
         v = (v.assign(_r=v["技術線型"].map(LINE_RANK).fillna(9))
               .sort_values(["_r", "勝率下限%"], ascending=[True, False]).drop(columns="_r").reset_index(drop=True))
     else:
         v = v.sort_values(sort_by.split("(")[0], ascending=False).reset_index(drop=True)
-    st.write(f"符合條件 **{len(v)}** 檔")
+    if sort_by != STRAT:
+        st.write(f"符合條件 **{len(v)}** 檔")
     if v.empty:
         st.info("沒有符合的股票,試著降低「最少獨立樣本」或「勝率優勢」。")
         return
@@ -2621,6 +2829,54 @@ with st.expander("停損 / 停利規則:參考價位與歷史效果(賣出訊號
                     f"(累計 {_bst['累計報酬%']:+.0f}%、最大回撤 {_bst['最大回撤%']:.0f}%、{int(_bst['交易次數'])} 筆)。")
         st.caption("只代表這檔股票自己的歷史與這個進場範例,樣本不多時請保守看待;未計滑價與跳空風險,過去結果不保證未來。")
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _strategy_eval(code, name, industry, last_key, pjson, _hd):
+    """依一組參數,判斷「最新一根 K 棒」是否符合買進條件。last_key / pjson 只用來決定快取何時失效。"""
+    P = SR.norm_params(json.loads(pjson))
+    sigs = sorted(set(SR.NEED_SIGS) | P["buy"] | P["block"] | P["exit"])
+    row = dict(stock_id=code, stock_name=name or code, industry_category=industry or "")
+    s = SR.prepare_stock(row, _hd, dict(build_signals=build_signals, tech_components=tech_components), sigs)
+    i = len(s["C"]) - 1
+    return dict(ex=SR.explain_entry(P, s, i), exits=SR.exit_hits(P, s, i), close=float(s["C"][i]), date=str(s["idx"][i].date()))
+
+
+def render_strategy_card(code, name, industry, hd):
+    """單股頁:套用「目前採用參數」(手動指定 > 最佳化 > 內建預設)的策略判斷,逐條列出條件有沒有過。"""
+    st.subheader("🧭 策略判斷(依目前採用參數)")
+    if SR is None:
+        st.caption("找不到 strategy_rules.py(請與 app1.py 放在同一個資料夾),略過策略判斷。")
+        return
+    R = SR.resolve_params()
+    P = R["P"]
+    head = {"active": "⭐ 你手動指定的參數", "optimized": "🔍 最新的最佳化參數", "default": "📦 內建預設(尚未做最佳化)"}[R["kind"]]
+    msg = f"**{head}**:{R['label']}  ·  {SR.param_text(P)}\n\n驗證結果:{R['verdict']}"
+    (st.warning if R["passed"] is False else st.info)(msg)
+    try:
+        last_key = f"{hd.index[-1]}|{float(hd.Close.iloc[-1]):.2f}|{int(hd.Volume.iloc[-1])}"
+        res = _strategy_eval(code, name, industry, last_key, json.dumps(SR.to_jsonable(P), sort_keys=True), hd)
+    except Exception as e:  # noqa: BLE001
+        st.caption(f"策略判斷暫時無法計算:{e}")
+        return
+    ex = res["ex"]
+    if ex["ok"]:
+        st.success(f"✅ **符合買進條件**(觸發:{'、'.join(SR.SIGN_NAME.get(b, b) for b in ex['hit'])})")
+        st.write(f"依參數的操作:隔日開盤分批買進,停損約 **{res['close'] * (1 - P['stop']):.2f}**(約 −{P['stop'] * 100:.0f}%),"
+                 f"最長持有 **{P['hold']}** 個交易日,單檔約總資產 **{P['pct'] * 100:.0f}%**。")
+    else:
+        st.info("❌ **目前不符合買進條件**,沒過的項目:" + "、".join(ex["failed"]))
+    T = pd.DataFrame(ex["checks"])
+    T["通過"] = T["通過"].map({True: "✅", False: "❌"})
+    st.dataframe(T, hide_index=True, use_container_width=True)
+    if res["exits"]:
+        st.warning("⚠️ 若你已持有:今天觸發此參數的賣出訊號 — " + "、".join(f"{x} {SR.SIGN_NAME.get(x, x)}" for x in res["exits"]))
+    else:
+        st.caption("若已持有:今天沒有觸發此參數的賣出訊號。")
+    st.caption(f"資料到 {res['date']}" + ("(盤中,K 棒尚未收完,收盤後才確定)" if market_open() else "")
+               + "。為與模擬交易、最佳化驗證一致,這裡的訊號不含法人資料,所以可能與上方「買進訊號⑤⑥」的法人條件略有差異。"
+               "同產業檔數上限、資金配置等「投資組合層級」條件不在單股判斷內。這是規則的判斷,不是預測;"
+               "若驗證結果是輸給 0050,請當作參考就好。")
+
+
 tab1, tabLive, tab2, tab3, tabBasic, tabFin, tab4, tab5, tab6, tab7 = st.tabs(
     ["總覽與建議", "即時走勢", "K線圖", "籌碼面", "基本", "財務", "估值", "回測", "新聞", "配息試算"])
 
@@ -2639,6 +2895,81 @@ with tab1:
         _r = pick_row(SS)
         st.info(f"📊 歷史相似情境:持有 {int(_r.持有天數)} 個交易日的勝率約 **{_r.勝率:.0f}%**"
                 f"(全期平均 {_r.全期基準勝率:.0f}%,樣本 {int(_r.樣本數)} 筆),詳見「回測」分頁。")
+    _inst_txt = "無資料"
+    st.subheader("🏦 法人連買/連賣後的歷史漲跌機率")
+    _S_inst = inst_all(prep_inst(finmind("TaiwanStockInstitutionalInvestorsBuySell", code, 4400)))
+    if _S_inst.empty or _hd.empty:
+        st.caption("查不到三大法人的長期歷史資料,無法統計。")
+    else:
+        _now = {w: streak(_S_inst[w]) for w in INST_WHO}
+        _mc = st.columns(3)
+        for _c, _w in zip(_mc, INST_WHO):
+            _sg, _n, _tot = _now[_w]
+            _c.metric(f"{_w}目前", "今日無買賣超" if _n == 0 else f"連{'買' if _sg > 0 else '賣'} {_n} 天",
+                      None if _n == 0 else f"{_tot:+,.0f} 張", delta_color="inverse")
+        _k1, _k2, _k3 = st.columns(3)
+        _who = _k1.selectbox("觀察對象", INST_WHO, key="inst_bt_who")
+        _hz = _k2.radio("看多久之後", [1, 5, 10, 20], index=0, horizontal=True, key="inst_bt_h2",
+                        format_func=lambda x: "隔天" if x == 1 else f"{x} 個交易日")
+        _big = _k3.slider("大漲/大跌門檻(%)", 1, 15, 3, key="inst_bt_big2")
+        _hzn = "隔天" if _hz == 1 else f"{_hz} 個交易日後"
+        _sg, _n, _tot = _now[_who]
+        IB = inst_streak_backtest(_hd, _S_inst, _who, _n, _big)
+        if IB is None or _hz not in IB["base"]:
+            st.caption("法人歷史資料不足(需至少約 1 年),無法統計。")
+        else:
+            _T, _B = IB["table"], IB["base"][_hz]
+            _tb = _T[_T["持有天數"] == _hz]
+            _lab = "連續買超" if _sg > 0 else "連續賣超"
+            if _n == 0:
+                _inst_txt = f"{_who}今日無買賣超"
+                st.info(f"{_who}今日沒有買賣超(連續天數歸零),請看下方歷史表格。")
+            else:
+                _nn = min(_n, 20)
+                _r = _tb[(_tb["方向"] == _lab) & (_tb["連續天數"] == _nn)]
+                if _r.empty:
+                    _inst_txt = f"{_who}{_lab}{_n}天,歷史上從未出現過這種連續天數"
+                    st.info(f"{_who}目前{_lab} {_n} 天,但這檔股票歷史上沒有出現過同樣長度的連續{_lab[2:]},無法統計。")
+                else:
+                    _r = _r.iloc[0]
+                    _inst_txt = (f"{_who}{_lab}{_n}天後{_hzn}:上漲機率{_r['上漲機率%']:.0f}%、下跌機率{_r['下跌機率%']:.0f}%、"
+                                 f"跌≥{_big}%機率{_r['大跌機率%']:.0f}%、漲≥{_big}%機率{_r['大漲機率%']:.0f}%、平均{_r['平均報酬%']:+.2f}%、"
+                                 f"歷史最差單次{_r['最差單次%']:+.1f}%(獨立事件{int(_r['次數'])}次;任意一天基準:上漲{_B['rise']:.0f}%/下跌{_B['fall']:.0f}%)")
+                    (st.error if _sg < 0 else st.success)(
+                        f"**{_who}目前{_lab} {_n} 天**。歷史上每次「{_who}{_lab}第 {_nn} 天」之後,**{_hzn}**:\n\n"
+                        f"- 上漲機率 **{_r['上漲機率%']:.0f}%**、下跌機率 **{_r['下跌機率%']:.0f}%**"
+                        f"(任意一天基準:上漲 {_B['rise']:.0f}% / 下跌 {_B['fall']:.0f}%)\n"
+                        f"- 大跌 ≥{_big}% 機率 **{_r['大跌機率%']:.0f}%**、大漲 ≥{_big}% 機率 **{_r['大漲機率%']:.0f}%**"
+                        f"(基準:跌 {_B['down']:.0f}% / 漲 {_B['up']:.0f}%)\n"
+                        f"- 平均報酬 {_r['平均報酬%']:+.2f}%、中位數 {_r['中位數%']:+.2f}%、歷史最差單次 **{_r['最差單次%']:+.1f}%**"
+                        f"(共 {int(_r['次數'])} 次獨立事件)")
+                    _risk = []
+                    if _r["次數"] < 30:
+                        _risk.append(f"樣本只有 {int(_r['次數'])} 次(可信度:{_r['可信度']}),機率誤差很大,不宜當作依據。")
+                    if _r["下跌機率%"] - _B["fall"] >= 10:
+                        _risk.append(f"此情境下跌機率比平常高 {_r['下跌機率%'] - _B['fall']:.0f} 個百分點,下檔風險偏高,"
+                                     + ("連買後追價要留意獲利回吐。" if _sg > 0 else "連賣期間不宜貿然攤平或抄底。"))
+                    elif _r["上漲機率%"] - _B["rise"] >= 10:
+                        _risk.append(f"此情境上漲機率比平常高 {_r['上漲機率%'] - _B['rise']:.0f} 個百分點,但仍有 {_r['下跌機率%']:.0f}% 的機率下跌,不是穩賺。")
+                    else:
+                        _risk.append("此情境的漲跌機率與平常差不多,法人連買/連賣在這檔股票上沒有明顯的預測力。")
+                    _risk.append(f"歷史最差單次 {_r['最差單次%']:+.1f}%、大跌 ≥{_big}% 機率 {_r['大跌機率%']:.0f}%:"
+                                 f"部位大小與停損請以「承受得起這個跌幅」為準,並事先設好停損價(可參考上方 ATR/支撐價位)。")
+                    _risk.append("單一訊號不要重壓,建議分批進出,並搭配技術面、融資券與估值一起判斷;遇到大盤急跌或個股重大消息時,歷史機率會失準。")
+                    if _n > 20:
+                        _risk.append("連續天數超過 20 天時,以「連續第 20 天」的歷史為準。")
+                    st.warning("**⚠️ 風險管控提醒**\n\n" + "\n".join("- " + x for x in _risk))
+            with st.expander(f"查看「{_who}」各連續天數的歷史統計({_hzn})"):
+                _show = _tb.drop(columns="持有天數").copy()
+                _show["目前"] = np.where((_show["方向"] == _lab) & (_show["連續天數"] == min(_n, 20)) & (_n > 0), "◀ 目前", "")
+                st.dataframe(_show.sort_values(["方向", "連續天數"]).round(1), hide_index=True, use_container_width=True)
+                st.caption(f"基準(任意一天,共 {_B['n']:,} 天):上漲 {_B['rise']:.1f}%、下跌 {_B['fall']:.1f}%、跌 ≥{_big}% {_B['down']:.1f}%、"
+                           f"漲 ≥{_big}% {_B['up']:.1f}%、平均 {_B['mean']:+.2f}%、最差 {_B['worst']:+.1f}%。"
+                           f"統計期間 {IB['start']:%Y-%m-%d} 起約 {IB['years']:.1f} 年。")
+            st.caption("說明:「隔天」= 隔天收盤相對當天收盤的漲跌幅;5/10/20 日假設隔日開盤進場(法人資料盤後才公布)。"
+                       "事件間隔至少與持有天數相同,避免重疊樣本灌水。股價為未還原權息的收盤價,除息日價差會被算進跌幅。歷史機率不代表未來。")
+    if not _hd.empty:
+        render_strategy_card(code, name, industry, merge_live(_hd, live))
     a, b = st.columns(2)
     with a:
         st.markdown(f"**技術面 {t_score:+d}**")
@@ -2655,7 +2986,7 @@ with tab1:
     if api_key:
         if st.button("產生 AI 解讀"):
             ctx = (f"代碼{code} 收盤{last.Close:.2f} 綜合評分{total}\n技術:{comps.iloc[-1].to_dict()}\n法人:{i_notes}\n"
-                   f"融資券:{m_stats} {m_notes}\n估值:{v_stats} {v_notes}\n新聞:\n" + "\n".join("- " + n["title"] for n in news))
+                   f"法人連買賣歷史統計:{_inst_txt}\n融資券:{m_stats} {m_notes}\n估值:{v_stats} {v_notes}\n新聞:\n" + "\n".join("- " + n["title"] for n in news))
             with st.spinner("分析中..."):
                 st.markdown(ai_advice(ctx, api_key))
     else:
@@ -2998,6 +3329,59 @@ with tabFin:
     st.caption("資料來源:FinMind(公開資訊觀測站財報);單位為億元,與 Yahoo 奇摩股市的數字可能略有出入。")
 
 with tab4:
+    st.subheader("🏷️ 同業估值:貴 / 合理 / 便宜")
+    if not re.fullmatch(r"[1-9]\d{3}", str(code)):
+        st.info("ETF 沒有本益比與淨值比,不做同業估值。")
+    else:
+        _mv = market_valuation()
+        _self = _mv[_mv.code == code]
+        _pe = float(per.PER.iloc[-1]) if not per.empty else (_self.pe.iloc[0] if len(_self) else None)
+        _pb = float(per.PBR.iloc[-1]) if not per.empty else (_self.pb.iloc[0] if len(_self) else None)
+        try:
+            _ref = float(df.Close.loc[:pd.to_datetime(per.date.iloc[-1])].iloc[-1]) if not per.empty else float(df.Close.iloc[-1])
+        except Exception:
+            _ref = float(df.Close.iloc[-1])
+        with st.spinner("查詢同業本益比 / 淨值比…"):
+            _peers, _src = peer_table(code, industry)
+        _fv = peer_fair_value(float(_qpx), _ref, _pe, _pb, _peers, industry)
+        _c = _fv["combined"]
+        if _c is None:
+            st.warning(f"算不出同業估值。產業別:{industry or '查不到'};同業 {len(_peers)} 檔。" + " ".join(_fv["notes"]))
+        else:
+            _icon = {"貴": "🔴", "合理": "🟡", "便宜": "🟢"}[_c["verdict"]]
+            _vmsg = (f"{_icon} **{name or code} 現價 {_qpx:.2f} 元,以同業倍數看:{_c['verdict']}**"
+                    f"(同業中位估價 {_c['mid']:.2f} 元,現價{'高於' if _c['gap_mid'] >= 0 else '低於'}中位 {abs(_c['gap_mid']):.1f}%)")
+            (st.error if _c["verdict"] == "貴" else st.success if _c["verdict"] == "便宜" else st.info)(_vmsg)
+            _d1 = "現價已在此區" if _qpx <= _c["cheap"] else "現價還高 %.1f%%" % ((_qpx / _c["cheap"] - 1) * 100)
+            _d3 = "現價已在此區" if _qpx >= _c["exp"] else "現價還差 %.1f%%" % ((_c["exp"] / _qpx - 1) * 100)
+            z1, z2, z3 = st.columns(3)
+            z1.metric("🟢 便宜價(≤)", f"{_c['cheap']:.2f} 元", _d1, delta_color="off")
+            z2.metric("🟡 合理價區間", f"{_c['cheap']:.2f} ~ {_c['exp']:.2f} 元", "現價在此區" if _c["cheap"] < _qpx < _c["exp"] else None, delta_color="off")
+            z3.metric("🔴 貴價(≥)", f"{_c['exp']:.2f} 元", _d3, delta_color="off")
+            _lo, _hi = min(_c["cheap"] * 0.75, _qpx * 0.9), max(_c["exp"] * 1.25, _qpx * 1.1)
+            fz = go.Figure()
+            for x0, x1, col, nm in ((_lo, _c["cheap"], "rgba(46,160,67,.35)", "便宜"), (_c["cheap"], _c["exp"], "rgba(210,170,0,.30)", "合理"), (_c["exp"], _hi, "rgba(220,50,47,.35)", "貴")):
+                fz.add_vrect(x0=x0, x1=x1, fillcolor=col, line_width=0, annotation_text=nm, annotation_position="top")
+            fz.add_vline(x=_c["mid"], line_dash="dot", line_color="gray", annotation_text=f"同業中位 {_c['mid']:.1f}", annotation_position="bottom")
+            fz.add_vline(x=float(_qpx), line_width=3, line_color="#1f77b4", annotation_text=f"現價 {_qpx:.1f}", annotation_position="top right")
+            fz.update_layout(height=150, margin=dict(l=10, r=10, t=25, b=25), xaxis=dict(range=[_lo, _hi], title="股價(元)"), yaxis=dict(visible=False), showlegend=False)
+            st.plotly_chart(fz, use_container_width=True)
+            _rows = []
+            for _vm in _fv["methods"]:
+                _rows.append({"方法": _vm["label"] + ("" if _vm["used"] else "(僅參考)"), "這檔倍數": round(_vm["cur"], 2),
+                              "同業 25% / 中位 / 75%": f"{_vm['q25']:.1f} / {_vm['q50']:.1f} / {_vm['q75']:.1f}", "比同業貴的程度": f"比 {_vm['pct']:.0f}% 的同業貴",
+                              "便宜價 ≤": round(_vm["cheap"], 2), "中位估價": round(_vm["mid"], 2), "貴價 ≥": round(_vm["exp"], 2), "判斷": _vm["verdict"],
+                              "每股基準": f"{'每股盈餘' if _vm['key'] == 'PE' else '每股淨值'} {_vm['base']:.2f}", "同業檔數": _vm["n"]})
+            st.dataframe(pd.DataFrame(_rows), hide_index=True, use_container_width=True)
+            st.caption(f"綜合區間 = {'、'.join(_c['methods'])} 兩種方法(或可用的那一種)的便宜價、中位估價、貴價各取平均。產業別:{industry};同業 {len(_peers)} 檔(不含自己);資料:{_src}。")
+            for _vnote in _fv["notes"]:
+                st.caption("⚠️ " + _vnote)
+            with st.expander("同業明細(本益比 / 淨值比)"):
+                st.dataframe(_peers.sort_values("pe").rename(columns={"code": "代碼", "name": "名稱", "pe": "本益比", "pb": "股價淨值比"}), hide_index=True, use_container_width=True)
+            st.caption("🔎 怎麼讀:便宜 / 貴是和「同產業其他公司的倍數」比,不是這檔自己的歷史(自己的歷史分位在下方)。成長快、獲利品質好的公司,長期倍數高於同業是常態;"
+                       "景氣循環股在獲利低點時本益比會被墊高、在高點時偏低,請搭配淨值比與景氣位置判斷。每股盈餘 / 每股淨值是由「收盤價 ÷ 倍數」反推,"
+                       "等於最近四季的稅後盈餘與最新一期淨值。僅供參考,不構成投資建議。")
+    st.divider()
     if per.empty:
         st.warning("查不到本益比資料。ETF(如 0050)沒有 EPS,因此沒有本益比;新上市或虧損的個股也可能沒有。")
         if v_stats:
