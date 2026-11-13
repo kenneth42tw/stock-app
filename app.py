@@ -916,66 +916,6 @@ def streak(series):
     return sg, n, tot
 
 
-INST_WHO = ("外資", "投信", "三大法人")
-
-
-def inst_all(inst):
-    """把 prep_inst 的結果整理成:外資 / 投信 / 自營商 / 三大法人 的每日淨買賣超(張)。"""
-    if inst is None or len(inst) == 0:
-        return pd.DataFrame()
-    S = pd.DataFrame({k: (inst[k] if k in inst else pd.Series(0.0, index=inst.index))
-                      for k in ("外資", "投信", "自營商")})
-    S["三大法人"] = S.sum(axis=1)
-    return S.sort_index()
-
-
-def inst_streak_backtest(hd, S, who, n_now=0, big=5.0, horizons=(1, 5, 10, 20), base_ns=(1, 2, 3, 5, 7, 10)):
-    """法人連續買超/賣超「第 N 天」之後,股價的歷史漲跌機率。
-    - 持有 1 日 = 「隔天」的漲跌幅(隔天收盤 vs 當天收盤)。
-    - 持有 5/10/20 日:法人資料盤後才公布,假設隔日開盤進場,持有到第 h 個交易日收盤。
-    - 事件只算「剛好連續第 N 天」那一天;事件間隔至少 h 天,避免重疊樣本重複計算。
-    - 大漲/大跌 = 報酬 >= +big% / <= -big%;基準 = 同期間任意一天的機率。"""
-    if S is None or S.empty or who not in S or hd is None or hd.empty:
-        return None
-    d = hd[hd.index >= S.index.min()]
-    if len(d) < 250:
-        return None
-    stk = sstreak(S[who].reindex(d.index).fillna(0.0)).values
-    entry = d.Open.shift(-1)
-    ns = sorted(set(base_ns) | ({min(int(n_now), 20)} if n_now > 0 else set()))
-    base, rows = {}, []
-    for h in horizons:
-        if h == 1:
-            fwd = ((d.Close.shift(-1) / d.Close - 1) * 100).values
-        else:
-            fwd = ((d.Close.shift(-h) / entry - 1) * 100).values
-        ok = ~np.isnan(fwd)
-        if not ok.any():
-            continue
-        f0 = fwd[ok]
-        base[h] = dict(n=int(ok.sum()), rise=float((f0 > 0).mean() * 100), fall=float((f0 < 0).mean() * 100),
-                       down=float((f0 <= -big).mean() * 100), up=float((f0 >= big).mean() * 100),
-                       mean=float(f0.mean()), worst=float(f0.min()))
-        for sg, lab in ((-1, "連續賣超"), (1, "連續買超")):
-            for n in ns:
-                keep, last = [], -10 ** 9
-                for p in np.flatnonzero((stk == sg * n) & ok):
-                    if p - last >= h:
-                        keep.append(p)
-                        last = p
-                if not keep:
-                    continue
-                r = fwd[keep]
-                rows.append({"方向": lab, "連續天數": n, "持有天數": h, "次數": len(r),
-                             "上漲機率%": (r > 0).mean() * 100, "下跌機率%": (r < 0).mean() * 100,
-                             "大跌機率%": (r <= -big).mean() * 100, "大漲機率%": (r >= big).mean() * 100,
-                             "平均報酬%": r.mean(), "中位數%": float(np.median(r)), "最差單次%": float(r.min()),
-                             "可信度": "樣本太少" if len(r) < 10 else "僅供參考" if len(r) < 30 else "尚可"})
-    if not rows:
-        return None
-    return dict(base=base, table=pd.DataFrame(rows), big=big, start=d.index[0], years=len(d) / 245)
-
-
 def push_telegram(text):
     tok, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
     if tok and chat:
@@ -1660,22 +1600,6 @@ def _goto_single(code):
 
 def _back_to_multi():
     st.session_state["mode"] = "多股同時分析"
-
-
-PAPER_MODE = "模擬交易"
-
-
-def render_paper():
-    """「模擬交易」模式:把 paper_dashboard.py(模擬帳戶 / 手動回測 / 自動優化 / 目前策略參數)直接內嵌在本頁。
-    paper_dashboard.py 要和本檔放在同一個資料夾,並且和 paper_live / paper_trade 等模組一起。"""
-    try:
-        import paper_dashboard as PD
-    except Exception as e:                       # noqa: BLE001
-        st.error(f"載入模擬交易失敗:{e}")
-        st.caption("請確認 paper_dashboard.py、paper_live.py、paper_trade.py、paper_optimize.py、paper_manual.py、"
-                   "paper_ui.py、strategy_rules.py 都和 app.py 放在同一個資料夾。")
-        return
-    PD.main(embedded=True)
 
 
 def render_multi(stocks, th):
@@ -2607,8 +2531,7 @@ def _apply_locks(L):
     ss["_lock_ver"] = ss.get("_lock_ver", 0) + 1
 
 
-if st.session_state.get("mode") != PAPER_MODE:
-    hero()
+hero()
 try:   # 讀取瀏覽器裡的鎖定資料(失敗也不影響程式)
     _stored = _lock_component()(write=st.session_state.get("_ls_write"), token=st.session_state.get("_ls_token", 0),
                                  key="kk_lock_store", default=None)
@@ -2619,11 +2542,7 @@ except Exception:
     pass
 st.session_state.setdefault("_locks", {})
 with st.sidebar:
-    mode = st.radio("模式", ["單一股票", "多股同時分析", "全市場勝率掃描", PAPER_MODE], horizontal=True, key="mode")
-if mode == PAPER_MODE:
-    render_paper()
-    st.stop()
-with st.sidebar:
+    mode = st.radio("模式", ["單一股票", "多股同時分析", "全市場勝率掃描"], horizontal=True, key="mode")
     stock_list = get_stock_list()
     code, name, industry, multi_list = "", "", "", []
     if mode == "單一股票":
@@ -2865,7 +2784,7 @@ def render_strategy_card(code, name, industry, hd):
     """單股頁:套用「目前採用參數」(手動指定 > 最佳化 > 內建預設)的策略判斷,逐條列出條件有沒有過。"""
     st.subheader("🧭 策略判斷(依目前採用參數)")
     if SR is None:
-        st.caption("找不到 strategy_rules.py(請與 app.py 放在同一個資料夾),略過策略判斷。")
+        st.caption("找不到 strategy_rules.py(請與 app1.py 放在同一個資料夾),略過策略判斷。")
         return
     R = SR.resolve_params()
     P = R["P"]
@@ -2916,79 +2835,6 @@ with tab1:
         _r = pick_row(SS)
         st.info(f"📊 歷史相似情境:持有 {int(_r.持有天數)} 個交易日的勝率約 **{_r.勝率:.0f}%**"
                 f"(全期平均 {_r.全期基準勝率:.0f}%,樣本 {int(_r.樣本數)} 筆),詳見「回測」分頁。")
-    _inst_txt = "無資料"
-    st.subheader("🏦 法人連買/連賣後的歷史漲跌機率")
-    _S_inst = inst_all(prep_inst(finmind("TaiwanStockInstitutionalInvestorsBuySell", code, 4400)))
-    if _S_inst.empty or _hd.empty:
-        st.caption("查不到三大法人的長期歷史資料,無法統計。")
-    else:
-        _now = {w: streak(_S_inst[w]) for w in INST_WHO}
-        _mc = st.columns(3)
-        for _c, _w in zip(_mc, INST_WHO):
-            _sg, _n, _tot = _now[_w]
-            _c.metric(f"{_w}目前", "今日無買賣超" if _n == 0 else f"連{'買' if _sg > 0 else '賣'} {_n} 天",
-                      None if _n == 0 else f"{_tot:+,.0f} 張", delta_color="inverse")
-        _k1, _k2, _k3 = st.columns(3)
-        _who = _k1.selectbox("觀察對象", INST_WHO, key="inst_bt_who")
-        _hz = _k2.radio("看多久之後", [1, 5, 10, 20], index=0, horizontal=True, key="inst_bt_h2",
-                        format_func=lambda x: "隔天" if x == 1 else f"{x} 個交易日")
-        _big = _k3.slider("大漲/大跌門檻(%)", 1, 15, 3, key="inst_bt_big2")
-        _hzn = "隔天" if _hz == 1 else f"{_hz} 個交易日後"
-        _sg, _n, _tot = _now[_who]
-        IB = inst_streak_backtest(_hd, _S_inst, _who, _n, _big)
-        if IB is None or _hz not in IB["base"]:
-            st.caption("法人歷史資料不足(需至少約 1 年),無法統計。")
-        else:
-            _T, _B = IB["table"], IB["base"][_hz]
-            _tb = _T[_T["持有天數"] == _hz]
-            _lab = "連續買超" if _sg > 0 else "連續賣超"
-            if _n == 0:
-                _inst_txt = f"{_who}今日無買賣超"
-                st.info(f"{_who}今日沒有買賣超(連續天數歸零),請看下方歷史表格。")
-            else:
-                _nn = min(_n, 20)
-                _r = _tb[(_tb["方向"] == _lab) & (_tb["連續天數"] == _nn)]
-                if _r.empty:
-                    _inst_txt = f"{_who}{_lab}{_n}天,歷史上從未出現過這種連續天數"
-                    st.info(f"{_who}目前{_lab} {_n} 天,但這檔股票歷史上沒有出現過同樣長度的連續{_lab[2:]},無法統計。")
-                else:
-                    _r = _r.iloc[0]
-                    _inst_txt = (f"{_who}{_lab}{_n}天後{_hzn}:上漲機率{_r['上漲機率%']:.0f}%、下跌機率{_r['下跌機率%']:.0f}%、"
-                                 f"跌≥{_big}%機率{_r['大跌機率%']:.0f}%、漲≥{_big}%機率{_r['大漲機率%']:.0f}%、平均{_r['平均報酬%']:+.2f}%、"
-                                 f"歷史最差單次{_r['最差單次%']:+.1f}%(獨立事件{int(_r['次數'])}次;任意一天基準:上漲{_B['rise']:.0f}%/下跌{_B['fall']:.0f}%)")
-                    (st.error if _sg < 0 else st.success)(
-                        f"**{_who}目前{_lab} {_n} 天**。歷史上每次「{_who}{_lab}第 {_nn} 天」之後,**{_hzn}**:\n\n"
-                        f"- 上漲機率 **{_r['上漲機率%']:.0f}%**、下跌機率 **{_r['下跌機率%']:.0f}%**"
-                        f"(任意一天基準:上漲 {_B['rise']:.0f}% / 下跌 {_B['fall']:.0f}%)\n"
-                        f"- 大跌 ≥{_big}% 機率 **{_r['大跌機率%']:.0f}%**、大漲 ≥{_big}% 機率 **{_r['大漲機率%']:.0f}%**"
-                        f"(基準:跌 {_B['down']:.0f}% / 漲 {_B['up']:.0f}%)\n"
-                        f"- 平均報酬 {_r['平均報酬%']:+.2f}%、中位數 {_r['中位數%']:+.2f}%、歷史最差單次 **{_r['最差單次%']:+.1f}%**"
-                        f"(共 {int(_r['次數'])} 次獨立事件)")
-                    _risk = []
-                    if _r["次數"] < 30:
-                        _risk.append(f"樣本只有 {int(_r['次數'])} 次(可信度:{_r['可信度']}),機率誤差很大,不宜當作依據。")
-                    if _r["下跌機率%"] - _B["fall"] >= 10:
-                        _risk.append(f"此情境下跌機率比平常高 {_r['下跌機率%'] - _B['fall']:.0f} 個百分點,下檔風險偏高,"
-                                     + ("連買後追價要留意獲利回吐。" if _sg > 0 else "連賣期間不宜貿然攤平或抄底。"))
-                    elif _r["上漲機率%"] - _B["rise"] >= 10:
-                        _risk.append(f"此情境上漲機率比平常高 {_r['上漲機率%'] - _B['rise']:.0f} 個百分點,但仍有 {_r['下跌機率%']:.0f}% 的機率下跌,不是穩賺。")
-                    else:
-                        _risk.append("此情境的漲跌機率與平常差不多,法人連買/連賣在這檔股票上沒有明顯的預測力。")
-                    _risk.append(f"歷史最差單次 {_r['最差單次%']:+.1f}%、大跌 ≥{_big}% 機率 {_r['大跌機率%']:.0f}%:"
-                                 f"部位大小與停損請以「承受得起這個跌幅」為準,並事先設好停損價(可參考上方 ATR/支撐價位)。")
-                    _risk.append("單一訊號不要重壓,建議分批進出,並搭配技術面、融資券與估值一起判斷;遇到大盤急跌或個股重大消息時,歷史機率會失準。")
-                    if _n > 20:
-                        _risk.append("連續天數超過 20 天時,以「連續第 20 天」的歷史為準。")
-                    st.warning("**⚠️ 風險管控提醒**\n\n" + "\n".join("- " + x for x in _risk))
-            with st.expander(f"查看「{_who}」各連續天數的歷史統計({_hzn})"):
-                _show = _tb.drop(columns="持有天數").copy()
-                _show["目前"] = np.where((_show["方向"] == _lab) & (_show["連續天數"] == min(_n, 20)) & (_n > 0), "◀ 目前", "")
-                st.dataframe(_show.sort_values(["方向", "連續天數"]).round(1), hide_index=True, use_container_width=True)
-                st.caption(f"基準(任意一天,共 {_B['n']:,} 天):上漲 {_B['rise']:.1f}%、下跌 {_B['fall']:.1f}%、跌 ≥{_big}% {_B['down']:.1f}%、"
-                           f"漲 ≥{_big}% {_B['up']:.1f}%、平均 {_B['mean']:+.2f}%、最差 {_B['worst']:+.1f}%。"
-                           f"統計期間 {IB['start']:%Y-%m-%d} 起約 {IB['years']:.1f} 年。")
-            st.caption("說明:「隔天」= 隔天收盤相對當天收盤的漲跌幅;5/10/20 日假設隔日開盤進場(法人資料盤後才公布)。"
-                       "事件間隔至少與持有天數相同,避免重疊樣本灌水。股價為未還原權息的收盤價,除息日價差會被算進跌幅。歷史機率不代表未來。")
     if not _hd.empty:
         render_strategy_card(code, name, industry, merge_live(_hd, live))
     a, b = st.columns(2)
@@ -3007,7 +2853,7 @@ with tab1:
     if api_key:
         if st.button("產生 AI 解讀"):
             ctx = (f"代碼{code} 收盤{last.Close:.2f} 綜合評分{total}\n技術:{comps.iloc[-1].to_dict()}\n法人:{i_notes}\n"
-                   f"法人連買賣歷史統計:{_inst_txt}\n融資券:{m_stats} {m_notes}\n估值:{v_stats} {v_notes}\n新聞:\n" + "\n".join("- " + n["title"] for n in news))
+                   f"融資券:{m_stats} {m_notes}\n估值:{v_stats} {v_notes}\n新聞:\n" + "\n".join("- " + n["title"] for n in news))
             with st.spinner("分析中..."):
                 st.markdown(ai_advice(ctx, api_key))
     else:
